@@ -3,7 +3,9 @@ module github.com/define42/NetForge
 go 1.24.13
 
 require (
+	github.com/containerd/cgroups/v3 v3.1.3
 	github.com/elastic/go-seccomp-bpf v1.6.0
+	github.com/go-ping/ping v1.2.0
 	github.com/google/nftables v0.3.0
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.7.0
@@ -14,13 +16,13 @@ require (
 
 require (
 	github.com/cilium/ebpf v0.16.0 // indirect
-	github.com/containerd/cgroups/v3 v3.1.3 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
+	github.com/google/uuid v1.4.0 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.17 // indirect

@@ -121,6 +121,66 @@ func (s *delayedNamespaceService) Status() (*StatusResponse, error) {
 	return s.status, nil
 }
 
+type fakeNamespacePinger struct {
+	network    string
+	privileged bool
+	count      int
+	interval   time.Duration
+	timeout    time.Duration
+	onRecv     func(namespacePingPacket)
+	runErr     error
+	stats      namespacePingStats
+}
+
+func (p *fakeNamespacePinger) SetNetwork(network string) {
+	p.network = network
+}
+
+func (p *fakeNamespacePinger) SetPrivileged(privileged bool) {
+	p.privileged = privileged
+}
+
+func (p *fakeNamespacePinger) SetCount(count int) {
+	p.count = count
+}
+
+func (p *fakeNamespacePinger) SetInterval(interval time.Duration) {
+	p.interval = interval
+}
+
+func (p *fakeNamespacePinger) SetTimeout(timeout time.Duration) {
+	p.timeout = timeout
+}
+
+func (p *fakeNamespacePinger) SetOnRecv(handler func(namespacePingPacket)) {
+	p.onRecv = handler
+}
+
+func (p *fakeNamespacePinger) Run() error {
+	if p.onRecv != nil && p.stats.PacketsRecv > 0 {
+		p.onRecv(namespacePingPacket{
+			NBytes: 64,
+			IPAddr: p.stats.IPAddr,
+			Seq:    1,
+			Rtt:    p.stats.AvgRtt,
+		})
+	}
+	return p.runErr
+}
+
+func (p *fakeNamespacePinger) Statistics() namespacePingStats {
+	return p.stats
+}
+
+func restorePingTestHooks() func() {
+	originalRunInNamedNamespace := runInNamedNamespace
+	originalNewNamespacePinger := newNamespacePinger
+	return func() {
+		runInNamedNamespace = originalRunInNamedNamespace
+		newNamespacePinger = originalNewNamespacePinger
+	}
+}
+
 func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	cfg := NSConfig{
 		Name:       "nsx",
@@ -543,6 +603,92 @@ func TestNamespaceCmdRunnerHelpers(t *testing.T) {
 func TestPingNamespaceAddressRejectsInvalidIP(t *testing.T) {
 	if _, err := pingNamespaceAddress("ns1", "not-an-ip"); err == nil {
 		t.Fatal("expected invalid ip error")
+	}
+}
+
+func TestPingNamespaceAddressUsesGoPinger(t *testing.T) {
+	restore := restorePingTestHooks()
+	defer restore()
+
+	var (
+		gotNamespace string
+		pinger       = &fakeNamespacePinger{
+			stats: namespacePingStats{
+				PacketsSent: 1,
+				PacketsRecv: 1,
+				PacketLoss:  0,
+				Addr:        "192.0.2.1",
+				IPAddr:      "192.0.2.1",
+				MinRtt:      5 * time.Millisecond,
+				AvgRtt:      5 * time.Millisecond,
+				MaxRtt:      5 * time.Millisecond,
+				StdDevRtt:   0,
+			},
+		}
+	)
+
+	runInNamedNamespace = func(namespaceName string, fn func() error) error {
+		gotNamespace = namespaceName
+		return fn()
+	}
+	newNamespacePinger = func(addr string) namespacePinger {
+		if addr != "192.0.2.1" {
+			t.Fatalf("newNamespacePinger addr = %q, want %q", addr, "192.0.2.1")
+		}
+		return pinger
+	}
+
+	output, err := pingNamespaceAddress("ns1", "192.0.2.1")
+	if err != nil {
+		t.Fatalf("pingNamespaceAddress failed: %v", err)
+	}
+	if gotNamespace != "ns1" {
+		t.Fatalf("runInNamedNamespace namespace = %q, want %q", gotNamespace, "ns1")
+	}
+	if pinger.network != "ip4" {
+		t.Fatalf("network = %q, want ip4", pinger.network)
+	}
+	if !pinger.privileged {
+		t.Fatal("expected privileged ping mode")
+	}
+	if pinger.count != 1 {
+		t.Fatalf("count = %d, want 1", pinger.count)
+	}
+	if pinger.timeout != 2*time.Second {
+		t.Fatalf("timeout = %s, want %s", pinger.timeout, 2*time.Second)
+	}
+	if !strings.Contains(output, "1 packets transmitted, 1 packets received, 0% packet loss") {
+		t.Fatalf("unexpected ping output: %s", output)
+	}
+	if !strings.Contains(output, "64 bytes from 192.0.2.1: icmp_seq=1") {
+		t.Fatalf("unexpected ping recv output: %s", output)
+	}
+}
+
+func TestPingNamespaceAddressTimeoutReturnsError(t *testing.T) {
+	restore := restorePingTestHooks()
+	defer restore()
+
+	runInNamedNamespace = func(_ string, fn func() error) error {
+		return fn()
+	}
+	newNamespacePinger = func(string) namespacePinger {
+		return &fakeNamespacePinger{
+			stats: namespacePingStats{
+				PacketsSent: 1,
+				PacketsRecv: 0,
+				PacketLoss:  100,
+				Addr:        "192.0.2.2",
+			},
+		}
+	}
+
+	output, err := pingNamespaceAddress("ns1", "192.0.2.2")
+	if err == nil || err.Error() != "ping timed out" {
+		t.Fatalf("pingNamespaceAddress error = %v, want ping timed out", err)
+	}
+	if !strings.Contains(output, "1 packets transmitted, 0 packets received, 100% packet loss") {
+		t.Fatalf("unexpected timeout output: %s", output)
 	}
 }
 

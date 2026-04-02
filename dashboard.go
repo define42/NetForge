@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +11,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os/exec"
 	"runtime"
 	"sort"
 	"strconv"
@@ -20,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	goping "github.com/go-ping/ping"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
@@ -104,9 +103,99 @@ type hostDashboardService struct {
 
 var dashboardSnapshotTaskTimeout = 750 * time.Millisecond
 
+var (
+	getNamedNamespaceHandle = netns.GetFromName
+	getCurrentNamespace     = netns.Get
+	setCurrentNamespace     = netns.Set
+	runInNamedNamespace     = withNamedNamespace
+	newNamespacePinger      = func(addr string) namespacePinger {
+		return &goNamespacePinger{Pinger: goping.New(addr)}
+	}
+)
+
 type dashboardTaskResult[T any] struct {
 	value T
 	err   error
+}
+
+type namespacePingPacket struct {
+	NBytes int
+	IPAddr string
+	Seq    int
+	Rtt    time.Duration
+}
+
+type namespacePingStats struct {
+	PacketsSent int
+	PacketsRecv int
+	PacketLoss  float64
+	Addr        string
+	IPAddr      string
+	MinRtt      time.Duration
+	AvgRtt      time.Duration
+	MaxRtt      time.Duration
+	StdDevRtt   time.Duration
+}
+
+type namespacePinger interface {
+	SetNetwork(string)
+	SetPrivileged(bool)
+	SetCount(int)
+	SetInterval(time.Duration)
+	SetTimeout(time.Duration)
+	SetOnRecv(func(namespacePingPacket))
+	Run() error
+	Statistics() namespacePingStats
+}
+
+type goNamespacePinger struct {
+	*goping.Pinger
+}
+
+func (p *goNamespacePinger) SetCount(count int) {
+	p.Pinger.Count = count
+}
+
+func (p *goNamespacePinger) SetInterval(interval time.Duration) {
+	p.Pinger.Interval = interval
+}
+
+func (p *goNamespacePinger) SetTimeout(timeout time.Duration) {
+	p.Pinger.Timeout = timeout
+}
+
+func (p *goNamespacePinger) SetOnRecv(handler func(namespacePingPacket)) {
+	p.Pinger.OnRecv = func(pkt *goping.Packet) {
+		ipAddr := ""
+		if pkt.IPAddr != nil {
+			ipAddr = pkt.IPAddr.String()
+		}
+		handler(namespacePingPacket{
+			NBytes: pkt.Nbytes,
+			IPAddr: ipAddr,
+			Seq:    pkt.Seq,
+			Rtt:    pkt.Rtt,
+		})
+	}
+}
+
+func (p *goNamespacePinger) Statistics() namespacePingStats {
+	stats := p.Pinger.Statistics()
+	ipAddr := ""
+	if stats.IPAddr != nil {
+		ipAddr = stats.IPAddr.String()
+	}
+	return namespacePingStats{
+		PacketsSent: stats.PacketsSent,
+		PacketsRecv: stats.PacketsRecv,
+		PacketLoss:  stats.PacketLoss,
+		Addr:        stats.Addr,
+		IPAddr:      ipAddr,
+		MinRtt:      stats.MinRtt,
+		AvgRtt:      stats.AvgRtt,
+		MaxRtt:      stats.MaxRtt,
+		StdDevRtt:   stats.StdDevRtt,
+	}
 }
 
 func startDashboardTask[T any](ctx context.Context, name string, fn func() (T, error)) <-chan dashboardTaskResult[T] {
@@ -750,56 +839,87 @@ func (s *hostDashboardService) checkTCPPort(namespaceName, targetIP string, port
 	return checkNamespaceTCPPort(namespaceName, targetIP, port)
 }
 
+func withNamedNamespace(namespaceName string, fn func() error) error {
+	ns, err := getNamedNamespaceHandle(namespaceName)
+	if err != nil {
+		return fmt.Errorf("lookup namespace %q: %w", namespaceName, err)
+	}
+	defer ns.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	original, err := getCurrentNamespace()
+	if err != nil {
+		return fmt.Errorf("get current namespace: %w", err)
+	}
+	defer original.Close()
+
+	if err := setCurrentNamespace(ns); err != nil {
+		return fmt.Errorf("enter namespace %q: %w", namespaceName, err)
+	}
+
+	err = fn()
+	restoreErr := setCurrentNamespace(original)
+	if err != nil {
+		if restoreErr != nil {
+			return fmt.Errorf("%w; restore original namespace: %v", err, restoreErr)
+		}
+		return err
+	}
+	if restoreErr != nil {
+		return fmt.Errorf("restore original namespace after entering %q: %w", namespaceName, restoreErr)
+	}
+	return nil
+}
+
 func pingNamespaceAddress(namespaceName, targetIP string) (string, error) {
 	ip := net.ParseIP(targetIP)
 	if ip == nil {
 		return "", fmt.Errorf("invalid IP address %q", targetIP)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	args := []string{"-n", "-c", "1", "-W", "2"}
+	pinger := newNamespacePinger(targetIP)
 	if ip.To4() != nil {
-		args = append(args, "-4")
+		pinger.SetNetwork("ip4")
 	} else {
-		args = append(args, "-6")
+		pinger.SetNetwork("ip6")
 	}
-	args = append(args, targetIP)
+	pinger.SetPrivileged(true)
+	pinger.SetCount(1)
+	pinger.SetInterval(200 * time.Millisecond)
+	pinger.SetTimeout(2 * time.Second)
 
-	cmd := exec.CommandContext(ctx, "ping", args...)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var recvLines []string
+	pinger.SetOnRecv(func(pkt namespacePingPacket) {
+		recvLines = append(recvLines, fmt.Sprintf("%d bytes from %s: icmp_seq=%d time=%s", pkt.NBytes, pkt.IPAddr, pkt.Seq, pkt.Rtt))
+	})
 
-	if err := startCmdInNamedNamespace(cmd, namespaceName); err != nil {
-		return "", fmt.Errorf("start ping in namespace %q: %w", namespaceName, err)
-	}
-
-	err := cmd.Wait()
-	output := strings.TrimSpace(stdout.String())
-	if stderr.Len() > 0 {
-		if output != "" {
-			output += "\n"
-		}
-		output += strings.TrimSpace(stderr.String())
+	err := runInNamedNamespace(namespaceName, pinger.Run)
+	stats := pinger.Statistics()
+	targetAddr := stats.Addr
+	if targetAddr == "" {
+		targetAddr = targetIP
 	}
 
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		if output == "" {
-			output = "ping timed out"
-		}
-		return output, errors.New("ping timed out")
+	summary := []string{
+		fmt.Sprintf("PING %s:", targetAddr),
 	}
+	summary = append(summary, recvLines...)
+	summary = append(summary, fmt.Sprintf("%d packets transmitted, %d packets received, %.0f%% packet loss", stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss))
+	if stats.PacketsRecv > 0 {
+		summary = append(summary, fmt.Sprintf("round-trip min/avg/max/stddev = %s/%s/%s/%s", stats.MinRtt, stats.AvgRtt, stats.MaxRtt, stats.StdDevRtt))
+	}
+	output := strings.Join(summary, "\n")
+
 	if err != nil {
 		if output == "" {
 			output = fmt.Sprintf("ping to %s from %s failed", targetIP, namespaceName)
 		}
 		return output, fmt.Errorf("ping %s from %s failed: %w", targetIP, namespaceName, err)
 	}
-	if output == "" {
-		output = fmt.Sprintf("ping to %s from %s succeeded", targetIP, namespaceName)
+	if stats.PacketsRecv == 0 {
+		return output, errors.New("ping timed out")
 	}
 	return output, nil
 }
@@ -813,37 +933,22 @@ func checkNamespaceTCPPort(namespaceName, targetIP string, port int) (string, er
 		return "", fmt.Errorf("invalid TCP port %d", port)
 	}
 
-	ns, err := netns.GetFromName(namespaceName)
-	if err != nil {
-		return "", fmt.Errorf("lookup namespace %q: %w", namespaceName, err)
-	}
-	defer ns.Close()
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	original, err := netns.Get()
-	if err != nil {
-		return "", fmt.Errorf("get current namespace: %w", err)
-	}
-	defer original.Close()
-
-	if err := netns.Set(ns); err != nil {
-		return "", fmt.Errorf("enter namespace %q: %w", namespaceName, err)
-	}
-	defer netns.Set(original)
-
 	network := "tcp4"
 	if ip.To4() == nil {
 		network = "tcp6"
 	}
 
 	addr := net.JoinHostPort(targetIP, strconv.Itoa(port))
-	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).Dial(network, addr)
-	if err != nil {
+	if err := runInNamedNamespace(namespaceName, func() error {
+		conn, err := (&net.Dialer{Timeout: 3 * time.Second}).Dial(network, addr)
+		if err != nil {
+			return err
+		}
+		_ = conn.Close()
+		return nil
+	}); err != nil {
 		return fmt.Sprintf("tcp connect to %s failed", addr), fmt.Errorf("tcp connect to %s from %s failed: %w", addr, namespaceName, err)
 	}
-	_ = conn.Close()
 
 	return fmt.Sprintf("tcp connect to %s from %s succeeded", addr, namespaceName), nil
 }
