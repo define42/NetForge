@@ -240,6 +240,57 @@ func TestNamespaceHTTPServiceSFTPOperations(t *testing.T) {
 		t.Fatalf("unexpected SFTPFetch response: %+v", fetchResp)
 	}
 
+	fetchChunkResp, err := svc.SFTPFetchChunk(SFTPFetchChunkRequest{
+		Connection: conn,
+		Path:       "/nested/upload.txt",
+		Offset:     2,
+		Length:     3,
+	})
+	if err != nil {
+		t.Fatalf("SFTPFetchChunk failed: %v", err)
+	}
+	if fetchChunkResp.Path != "/nested/upload.txt" || fetchChunkResp.Offset != 2 || string(fetchChunkResp.Data) != "ylo" || fetchChunkResp.EOF {
+		t.Fatalf("unexpected SFTPFetchChunk response: %+v", fetchChunkResp)
+	}
+
+	pushChunkResp, err := svc.SFTPPushChunk(SFTPPushChunkRequest{
+		Connection:    conn,
+		Path:          "/nested/stream.txt",
+		Offset:        0,
+		Data:          []byte("pay"),
+		Mode:          0o600,
+		CreateParents: true,
+		Truncate:      true,
+	})
+	if err != nil {
+		t.Fatalf("SFTPPushChunk first write failed: %v", err)
+	}
+	if pushChunkResp.Path != "/nested/stream.txt" || pushChunkResp.Offset != 0 || pushChunkResp.BytesWritten != 3 {
+		t.Fatalf("unexpected first SFTPPushChunk response: %+v", pushChunkResp)
+	}
+
+	pushChunkResp, err = svc.SFTPPushChunk(SFTPPushChunkRequest{
+		Connection: conn,
+		Path:       "/nested/stream.txt",
+		Offset:     3,
+		Data:       []byte("load"),
+		Mode:       0o600,
+	})
+	if err != nil {
+		t.Fatalf("SFTPPushChunk second write failed: %v", err)
+	}
+	if pushChunkResp.Path != "/nested/stream.txt" || pushChunkResp.Offset != 3 || pushChunkResp.BytesWritten != 4 {
+		t.Fatalf("unexpected second SFTPPushChunk response: %+v", pushChunkResp)
+	}
+
+	streamed, err := os.ReadFile(filepath.Join(root, "nested", "stream.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile stream.txt failed: %v", err)
+	}
+	if string(streamed) != "payload" {
+		t.Fatalf("unexpected streamed file content: %q", string(streamed))
+	}
+
 	deleteResp, err := svc.SFTPDelete(SFTPDeleteRequest{
 		Connection: conn,
 		Path:       "/nested/upload.txt",

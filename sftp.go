@@ -22,11 +22,14 @@ const (
 	defaultSFTPPort          = "22"
 	maxSFTPTransferBytes     = 32 << 20
 	namespaceSFTPDialTimeout = 5 * time.Second
+	defaultSFTPChunkBytes    = 256 << 10
 )
 
 type namespaceSFTPFile interface {
 	io.Reader
+	io.ReaderAt
 	io.Writer
+	io.WriterAt
 	io.Closer
 	Stat() (os.FileInfo, error)
 }
@@ -120,10 +123,26 @@ func (s *namespaceHTTPService) SFTPFetch(req SFTPFetchRequest) (*SFTPFetchRespon
 	return resp, nil
 }
 
+func (s *namespaceHTTPService) SFTPFetchChunk(req SFTPFetchChunkRequest) (*SFTPFetchChunkResponse, error) {
+	resp, err := fetchNamespaceSFTPChunk(req)
+	if err != nil {
+		return nil, fmt.Errorf("sftp fetch chunk from %s failed: %w", s.cfg.Namespace, err)
+	}
+	return resp, nil
+}
+
 func (s *namespaceHTTPService) SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error) {
 	resp, err := pushNamespaceSFTP(req)
 	if err != nil {
 		return nil, fmt.Errorf("sftp push from %s failed: %w", s.cfg.Namespace, err)
+	}
+	return resp, nil
+}
+
+func (s *namespaceHTTPService) SFTPPushChunk(req SFTPPushChunkRequest) (*SFTPPushChunkResponse, error) {
+	resp, err := pushNamespaceSFTPChunk(req)
+	if err != nil {
+		return nil, fmt.Errorf("sftp push chunk from %s failed: %w", s.cfg.Namespace, err)
 	}
 	return resp, nil
 }
@@ -210,6 +229,63 @@ func fetchNamespaceSFTP(req SFTPFetchRequest) (*SFTPFetchResponse, error) {
 	}, nil
 }
 
+func fetchNamespaceSFTPChunk(req SFTPFetchChunkRequest) (*SFTPFetchChunkResponse, error) {
+	remotePath, err := requireSFTPPath(req.Path)
+	if err != nil {
+		return nil, err
+	}
+	if req.Offset < 0 {
+		return nil, fmt.Errorf("sftp offset %d must be non-negative", req.Offset)
+	}
+	if req.Length < 1 || req.Length > maxSFTPTransferBytes {
+		return nil, fmt.Errorf("sftp chunk length %d must be between 1 and %d", req.Length, maxSFTPTransferBytes)
+	}
+
+	client, err := openNamespaceSFTPClient(req.Connection)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+
+	file, err := client.Open(remotePath)
+	if err != nil {
+		return nil, fmt.Errorf("open remote file %q: %w", remotePath, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat remote file %q: %w", remotePath, err)
+	}
+
+	if req.Offset >= info.Size() {
+		return &SFTPFetchChunkResponse{
+			Path:      remotePath,
+			Offset:    req.Offset,
+			Data:      []byte{},
+			EOF:       true,
+			TotalSize: info.Size(),
+			Mode:      uint32(info.Mode()),
+		}, nil
+	}
+
+	buf := make([]byte, req.Length)
+	readBytes, readErr := file.ReadAt(buf, req.Offset)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return nil, fmt.Errorf("read remote file %q chunk at offset %d: %w", remotePath, req.Offset, readErr)
+	}
+	buf = buf[:readBytes]
+
+	return &SFTPFetchChunkResponse{
+		Path:      remotePath,
+		Offset:    req.Offset,
+		Data:      buf,
+		EOF:       req.Offset+int64(readBytes) >= info.Size(),
+		TotalSize: info.Size(),
+		Mode:      uint32(info.Mode()),
+	}, nil
+}
+
 func pushNamespaceSFTP(req SFTPPushRequest) (*SFTPPushResponse, error) {
 	remotePath, err := requireSFTPPath(req.Path)
 	if err != nil {
@@ -259,6 +335,70 @@ func pushNamespaceSFTP(req SFTPPushRequest) (*SFTPPushResponse, error) {
 
 	return &SFTPPushResponse{
 		Path:         remotePath,
+		BytesWritten: int64(written),
+	}, nil
+}
+
+func pushNamespaceSFTPChunk(req SFTPPushChunkRequest) (*SFTPPushChunkResponse, error) {
+	remotePath, err := requireSFTPPath(req.Path)
+	if err != nil {
+		return nil, err
+	}
+	if req.Offset < 0 {
+		return nil, fmt.Errorf("sftp offset %d must be non-negative", req.Offset)
+	}
+	if req.Truncate && req.Offset != 0 {
+		return nil, errors.New("sftp truncate is only allowed at offset 0")
+	}
+	if int64(len(req.Data)) > maxSFTPTransferBytes {
+		return nil, fmt.Errorf("push chunk exceeds %d byte limit", maxSFTPTransferBytes)
+	}
+
+	client, err := openNamespaceSFTPClient(req.Connection)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+
+	if req.CreateParents {
+		parent := pathpkg.Dir(remotePath)
+		if parent != "." {
+			if err := client.MkdirAll(parent); err != nil {
+				return nil, fmt.Errorf("create remote parent directories for %q: %w", remotePath, err)
+			}
+		}
+	}
+
+	flags := os.O_CREATE | os.O_WRONLY
+	if req.Truncate {
+		flags |= os.O_TRUNC
+	}
+	file, err := client.OpenFile(remotePath, flags)
+	if err != nil {
+		return nil, fmt.Errorf("open remote file %q for chunk write: %w", remotePath, err)
+	}
+
+	written, writeErr := file.WriteAt(req.Data, req.Offset)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return nil, fmt.Errorf("write remote file %q chunk at offset %d: %w", remotePath, req.Offset, writeErr)
+	}
+	if written != len(req.Data) {
+		return nil, fmt.Errorf("write remote file %q chunk at offset %d: short write %d/%d", remotePath, req.Offset, written, len(req.Data))
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close remote file %q after chunk write: %w", remotePath, closeErr)
+	}
+
+	if req.Mode != 0 {
+		if err := client.Chmod(remotePath, os.FileMode(req.Mode)); err != nil {
+			return nil, fmt.Errorf("chmod remote file %q: %w", remotePath, err)
+		}
+	}
+
+	return &SFTPPushChunkResponse{
+		Path:         remotePath,
+		Offset:       req.Offset,
 		BytesWritten: int64(written),
 	}, nil
 }

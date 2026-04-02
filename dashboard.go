@@ -44,23 +44,28 @@ type hostNamespaceView struct {
 }
 
 type hostDashboardData struct {
-	HostHTTPAddr          string              `json:"host_http_addr"`
-	ParentNIC             string              `json:"parent_nic"`
-	RuntimeBase           string              `json:"runtime_base"`
-	Namespaces            []hostNamespaceView `json:"namespaces"`
-	SelectedPingNamespace string              `json:"selected_ping_namespace,omitempty"`
-	PingTargetIP          string              `json:"ping_target_ip,omitempty"`
-	PingResult            *hostPingResultView `json:"ping_result,omitempty"`
-	SelectedTCPNamespace  string              `json:"selected_tcp_namespace,omitempty"`
-	TCPTargetIP           string              `json:"tcp_target_ip,omitempty"`
-	TCPTargetPort         string              `json:"tcp_target_port,omitempty"`
-	TCPCheckResult        *hostTCPResultView  `json:"tcp_check_result,omitempty"`
-	SelectedSFTPNamespace string              `json:"selected_sftp_namespace,omitempty"`
-	SFTPServerHost        string              `json:"sftp_server_host,omitempty"`
-	SFTPServerPort        string              `json:"sftp_server_port,omitempty"`
-	SFTPUsername          string              `json:"sftp_username,omitempty"`
-	SFTPDirectory         string              `json:"sftp_directory,omitempty"`
-	SFTPListResult        *hostSFTPResultView `json:"sftp_list_result,omitempty"`
+	HostHTTPAddr          string                  `json:"host_http_addr"`
+	ParentNIC             string                  `json:"parent_nic"`
+	RuntimeBase           string                  `json:"runtime_base"`
+	Namespaces            []hostNamespaceView     `json:"namespaces"`
+	Jobs                  []hostSFTPSyncJobView   `json:"jobs,omitempty"`
+	JobsError             string                  `json:"jobs_error,omitempty"`
+	SFTPJobForm           hostSFTPSyncJobFormData `json:"sftp_job_form,omitempty"`
+	SFTPJobMessage        string                  `json:"sftp_job_message,omitempty"`
+	SFTPJobError          string                  `json:"sftp_job_error,omitempty"`
+	SelectedPingNamespace string                  `json:"selected_ping_namespace,omitempty"`
+	PingTargetIP          string                  `json:"ping_target_ip,omitempty"`
+	PingResult            *hostPingResultView     `json:"ping_result,omitempty"`
+	SelectedTCPNamespace  string                  `json:"selected_tcp_namespace,omitempty"`
+	TCPTargetIP           string                  `json:"tcp_target_ip,omitempty"`
+	TCPTargetPort         string                  `json:"tcp_target_port,omitempty"`
+	TCPCheckResult        *hostTCPResultView      `json:"tcp_check_result,omitempty"`
+	SelectedSFTPNamespace string                  `json:"selected_sftp_namespace,omitempty"`
+	SFTPServerHost        string                  `json:"sftp_server_host,omitempty"`
+	SFTPServerPort        string                  `json:"sftp_server_port,omitempty"`
+	SFTPUsername          string                  `json:"sftp_username,omitempty"`
+	SFTPDirectory         string                  `json:"sftp_directory,omitempty"`
+	SFTPListResult        *hostSFTPResultView     `json:"sftp_list_result,omitempty"`
 }
 
 type hostNICStatisticsView struct {
@@ -112,6 +117,7 @@ type hostDashboardService struct {
 	parentNIC    string
 	runtimeBase  string
 	plugins      []*runningPlugin
+	jobManager   *sftpSyncJobManager
 	statsLookup  func(namespaceName, ifName string) (hostNICStatisticsView, error)
 	arpLookup    func(namespaceName, ifName string) ([]hostARPEntryView, error)
 	pingFunc     func(namespaceName, targetIP string) (string, error)
@@ -506,6 +512,132 @@ pre {
 </div>
 </div>
 </div>
+<div class="card ping-card">
+<h2>SFTP Sync Jobs</h2>
+<form class="ping-form" method="post" action="/sftp-jobs/create">
+<label>From Namespace
+<select name="from_namespace" required>
+<option value="">Select namespace</option>
+{{range .Namespaces}}
+<option value="{{.Name}}" {{if eq $.SFTPJobForm.FromNamespace .Name}}selected{{end}}>{{.Name}}</option>
+{{end}}
+</select>
+</label>
+<label>From Server IP / Host
+<input type="text" name="from_host" placeholder="192.168.1.10" value="{{.SFTPJobForm.FromHost}}" required>
+</label>
+<label>From TCP Port
+<input type="number" name="from_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.FromPort}}" required>
+</label>
+<label>From User Name
+<input type="text" name="from_username" placeholder="source-user" value="{{.SFTPJobForm.FromUsername}}" required>
+</label>
+<label>From Password
+<input type="password" name="from_password" placeholder="password" required>
+</label>
+<label>From Directory
+<input type="text" name="from_directory" placeholder="/incoming" value="{{.SFTPJobForm.FromDirectory}}" required>
+</label>
+<label>To Namespace
+<select name="to_namespace" required>
+<option value="">Select namespace</option>
+{{range .Namespaces}}
+<option value="{{.Name}}" {{if eq $.SFTPJobForm.ToNamespace .Name}}selected{{end}}>{{.Name}}</option>
+{{end}}
+</select>
+</label>
+<label>To Server IP / Host
+<input type="text" name="to_host" placeholder="192.168.1.20" value="{{.SFTPJobForm.ToHost}}" required>
+</label>
+<label>To TCP Port
+<input type="number" name="to_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.ToPort}}" required>
+</label>
+<label>To User Name
+<input type="text" name="to_username" placeholder="dest-user" value="{{.SFTPJobForm.ToUsername}}" required>
+</label>
+<label>To Password
+<input type="password" name="to_password" placeholder="password" required>
+</label>
+<label>To Directory
+<input type="text" name="to_directory" placeholder="/archive" value="{{.SFTPJobForm.ToDirectory}}" required>
+</label>
+<label>Run Interval
+<input type="text" name="interval" placeholder="5m" value="{{.SFTPJobForm.Interval}}" required>
+</label>
+<div>
+<button type="submit">Add SFTP Sync Job</button>
+</div>
+</form>
+{{if .SFTPJobMessage}}
+<div class="status-ok" style="margin-top: 1rem;">{{.SFTPJobMessage}}</div>
+{{end}}
+{{if .SFTPJobError}}
+<div class="status-bad" style="margin-top: 1rem;">{{.SFTPJobError}}</div>
+{{end}}
+{{if .JobsError}}
+<div class="status-bad" style="margin-top: 1rem;">{{.JobsError}}</div>
+{{end}}
+<table style="margin-top: 1rem;">
+<thead>
+<tr>
+<th>ID</th>
+<th>From</th>
+<th>To</th>
+<th>Interval</th>
+<th>State</th>
+<th>Last Result</th>
+<th>Controls</th>
+</tr>
+</thead>
+<tbody>
+{{range .Jobs}}
+<tr>
+<td><code>{{.ID}}</code></td>
+<td><code>{{.FromNamespace}}</code><br><code>{{.FromAddress}}</code><br><code>{{.FromUsername}}</code><br><code>{{.FromDirectory}}</code></td>
+<td><code>{{.ToNamespace}}</code><br><code>{{.ToAddress}}</code><br><code>{{.ToUsername}}</code><br><code>{{.ToDirectory}}</code></td>
+<td><code>{{.Interval}}</code></td>
+<td>
+{{if .Enabled}}
+<span class="status-ok">enabled</span>
+{{else}}
+<span class="status-bad">disabled</span>
+{{end}}
+<br>
+{{if .Running}}
+<code>scheduler running</code>
+{{else}}
+<code>scheduler stopped</code>
+{{end}}
+</td>
+<td>
+<code>{{if .LastStatus}}{{.LastStatus}}{{else}}idle{{end}}</code><br>
+<code>files copied {{.LastFilesCopied}}</code><br>
+{{if .LastRunAt}}<code>last run {{.LastRunAt}}</code><br>{{end}}
+{{if .LastSuccessAt}}<code>last success {{.LastSuccessAt}}</code><br>{{end}}
+{{if .LastError}}<span class="status-bad">{{.LastError}}</span>{{end}}
+</td>
+<td>
+{{if .Enabled}}
+<form method="post" action="/sftp-jobs/stop">
+<input type="hidden" name="job_id" value="{{.ID}}">
+<button type="submit">Stop</button>
+</form>
+{{else}}
+<form method="post" action="/sftp-jobs/start">
+<input type="hidden" name="job_id" value="{{.ID}}">
+<button type="submit">Start</button>
+</form>
+{{end}}
+</td>
+</tr>
+{{else}}
+<tr>
+<td colspan="7"><code>no jobs configured</code></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+</div>
 <table>
 <thead>
 <tr>
@@ -684,12 +816,21 @@ func (s *hostDashboardService) snapshotWithContext(ctx context.Context) hostDash
 	}
 	wg.Wait()
 
-	return hostDashboardData{
+	data := hostDashboardData{
 		HostHTTPAddr: s.addr,
 		ParentNIC:    s.parentNIC,
 		RuntimeBase:  s.runtimeBase,
 		Namespaces:   namespaces,
 	}
+	if s.jobManager != nil {
+		jobs, err := s.jobManager.Snapshot()
+		if err != nil {
+			data.JobsError = err.Error()
+		} else {
+			data.Jobs = jobs
+		}
+	}
+	return data
 }
 
 func lookupNamespaceARPTable(namespaceName, ifName string) ([]hostARPEntryView, error) {
@@ -777,6 +918,9 @@ func (s *hostDashboardService) routes() http.Handler {
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/tcp-check", s.handleTCPCheck)
 	mux.HandleFunc("/sftp-list", s.handleSFTPList)
+	mux.HandleFunc("/sftp-jobs/create", s.handleCreateSFTPJob)
+	mux.HandleFunc("/sftp-jobs/start", s.handleStartSFTPJob)
+	mux.HandleFunc("/sftp-jobs/stop", s.handleStopSFTPJob)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/namespaces", s.handleNamespacesAPI)
 	return mux
@@ -955,6 +1099,146 @@ func (s *hostDashboardService) handleSFTPList(w http.ResponseWriter, r *http.Req
 	s.renderIndex(w, data)
 }
 
+func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	form := hostSFTPSyncJobFormData{
+		FromNamespace: strings.TrimSpace(r.FormValue("from_namespace")),
+		FromHost:      strings.Trim(strings.TrimSpace(r.FormValue("from_host")), "[]"),
+		FromPort:      strings.TrimSpace(r.FormValue("from_port")),
+		FromUsername:  strings.TrimSpace(r.FormValue("from_username")),
+		FromDirectory: strings.TrimSpace(r.FormValue("from_directory")),
+		ToNamespace:   strings.TrimSpace(r.FormValue("to_namespace")),
+		ToHost:        strings.Trim(strings.TrimSpace(r.FormValue("to_host")), "[]"),
+		ToPort:        strings.TrimSpace(r.FormValue("to_port")),
+		ToUsername:    strings.TrimSpace(r.FormValue("to_username")),
+		ToDirectory:   strings.TrimSpace(r.FormValue("to_directory")),
+		Interval:      strings.TrimSpace(r.FormValue("interval")),
+	}
+	fromPassword := r.FormValue("from_password")
+	toPassword := r.FormValue("to_password")
+
+	data := s.snapshotWithContext(r.Context())
+	data.SFTPJobForm = form
+
+	if s.jobManager == nil {
+		data.SFTPJobError = "sftp job manager unavailable"
+		s.renderIndex(w, data)
+		return
+	}
+
+	fromPort, err := strconv.Atoi(form.FromPort)
+	if err != nil || fromPort < 1 || fromPort > 65535 {
+		data.SFTPJobError = fmt.Sprintf("invalid source TCP port %q", form.FromPort)
+		s.renderIndex(w, data)
+		return
+	}
+
+	toPort, err := strconv.Atoi(form.ToPort)
+	if err != nil || toPort < 1 || toPort > 65535 {
+		data.SFTPJobError = fmt.Sprintf("invalid destination TCP port %q", form.ToPort)
+		s.renderIndex(w, data)
+		return
+	}
+
+	interval, err := parseDashboardJobInterval(form.Interval)
+	if err != nil {
+		data.SFTPJobError = err.Error()
+		s.renderIndex(w, data)
+		return
+	}
+
+	job, err := s.jobManager.CreateJob(sftpSyncJobSpec{
+		From: sftpEndpointConfig{
+			Namespace: form.FromNamespace,
+			Host:      form.FromHost,
+			Port:      fromPort,
+			Username:  form.FromUsername,
+			Password:  fromPassword,
+			Directory: form.FromDirectory,
+		},
+		To: sftpEndpointConfig{
+			Namespace: form.ToNamespace,
+			Host:      form.ToHost,
+			Port:      toPort,
+			Username:  form.ToUsername,
+			Password:  toPassword,
+			Directory: form.ToDirectory,
+		},
+		Interval: interval,
+	})
+	if err != nil {
+		data.SFTPJobError = err.Error()
+		s.renderIndex(w, data)
+		return
+	}
+
+	data = s.snapshotWithContext(r.Context())
+	data.SFTPJobMessage = fmt.Sprintf("Created SFTP sync job #%d. Start it when you are ready.", job.ID)
+	s.renderIndex(w, data)
+}
+
+func (s *hostDashboardService) handleStartSFTPJob(w http.ResponseWriter, r *http.Request) {
+	s.handleSFTPJobStateChange(w, r, true)
+}
+
+func (s *hostDashboardService) handleStopSFTPJob(w http.ResponseWriter, r *http.Request) {
+	s.handleSFTPJobStateChange(w, r, false)
+}
+
+func (s *hostDashboardService) handleSFTPJobStateChange(w http.ResponseWriter, r *http.Request, start bool) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	data := s.snapshotWithContext(r.Context())
+	if s.jobManager == nil {
+		data.SFTPJobError = "sftp job manager unavailable"
+		s.renderIndex(w, data)
+		return
+	}
+
+	jobID, err := parseDashboardJobID(strings.TrimSpace(r.FormValue("job_id")))
+	if err != nil {
+		data.SFTPJobError = err.Error()
+		s.renderIndex(w, data)
+		return
+	}
+
+	if start {
+		job, err := s.jobManager.StartJob(jobID)
+		if err != nil {
+			data.SFTPJobError = err.Error()
+		} else {
+			data = s.snapshotWithContext(r.Context())
+			data.SFTPJobMessage = fmt.Sprintf("Started SFTP sync job #%d (%s -> %s).", job.ID, job.From.Namespace, job.To.Namespace)
+		}
+		s.renderIndex(w, data)
+		return
+	}
+
+	job, err := s.jobManager.StopJob(jobID)
+	if err != nil {
+		data.SFTPJobError = err.Error()
+	} else {
+		data = s.snapshotWithContext(r.Context())
+		data.SFTPJobMessage = fmt.Sprintf("Stopped SFTP sync job #%d (%s -> %s).", job.ID, job.From.Namespace, job.To.Namespace)
+	}
+	s.renderIndex(w, data)
+}
+
 func (s *hostDashboardService) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
@@ -1011,6 +1295,17 @@ func (s *hostDashboardService) listSFTP(namespaceName string, req SFTPListReques
 		return nil, fmt.Errorf("plugin rpc for namespace %q is unavailable", namespaceName)
 	}
 	return plugin.rpc.SFTPList(req)
+}
+
+func parseDashboardJobID(raw string) (int64, error) {
+	if raw == "" {
+		return 0, errors.New("job id is required")
+	}
+	jobID, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || jobID < 1 {
+		return 0, fmt.Errorf("invalid job id %q", raw)
+	}
+	return jobID, nil
 }
 
 func withNamedNamespace(namespaceName string, fn func() error) error {
@@ -1122,12 +1417,13 @@ func checkCurrentNamespaceTCPPort(namespaceName, targetIP string, port int) (str
 	return fmt.Sprintf("tcp connect to %s from %s succeeded", addr, namespaceName), nil
 }
 
-func startHostDashboard(addr, parentNIC, runtimeBase string, plugins []*runningPlugin) (*http.Server, string, error) {
+func startHostDashboard(addr, parentNIC, runtimeBase string, plugins []*runningPlugin, jobManager *sftpSyncJobManager) (*http.Server, string, error) {
 	service := &hostDashboardService{
 		addr:        addr,
 		parentNIC:   parentNIC,
 		runtimeBase: runtimeBase,
 		plugins:     plugins,
+		jobManager:  jobManager,
 	}
 
 	listener, err := net.Listen("tcp", addr)

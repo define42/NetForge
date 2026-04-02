@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -67,7 +68,24 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAd
 		log.Printf("namespace=%s message=%q http=%s running=%v", desc.Namespace, desc.Message, status.HTTPAddr, status.HTTPRunning)
 	}
 
-	server, actualAddr, err := startHostDashboard(hostHTTPAddr, parentNIC, runtimeBase, plugins)
+	jobManager, err := openSFTPSyncJobManager(filepath.Join(runtimeBase, sftpJobsDBFilename), func(namespace string) *runningPlugin {
+		for _, plugin := range plugins {
+			if plugin != nil && plugin.cfg.Name == namespace {
+				return plugin
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := jobManager.Close(); closeErr != nil {
+			log.Printf("close sftp job manager: %v", closeErr)
+		}
+	}()
+
+	server, actualAddr, err := startHostDashboard(hostHTTPAddr, parentNIC, runtimeBase, plugins, jobManager)
 	if err != nil {
 		return err
 	}

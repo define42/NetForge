@@ -79,12 +79,28 @@ type SFTPFetchRequest struct {
 	Path       string             `json:"path"`
 }
 
+type SFTPFetchChunkRequest struct {
+	Connection SFTPConnectionInfo `json:"connection"`
+	Path       string             `json:"path"`
+	Offset     int64              `json:"offset"`
+	Length     int                `json:"length"`
+}
+
 type SFTPFetchResponse struct {
 	Path        string `json:"path"`
 	Data        []byte `json:"data"`
 	Size        int64  `json:"size"`
 	Mode        uint32 `json:"mode"`
 	ModTimeUnix int64  `json:"mod_time_unix"`
+}
+
+type SFTPFetchChunkResponse struct {
+	Path      string `json:"path"`
+	Offset    int64  `json:"offset"`
+	Data      []byte `json:"data"`
+	EOF       bool   `json:"eof"`
+	TotalSize int64  `json:"total_size"`
+	Mode      uint32 `json:"mode"`
 }
 
 type SFTPPushRequest struct {
@@ -95,8 +111,24 @@ type SFTPPushRequest struct {
 	CreateParents bool               `json:"create_parents"`
 }
 
+type SFTPPushChunkRequest struct {
+	Connection    SFTPConnectionInfo `json:"connection"`
+	Path          string             `json:"path"`
+	Offset        int64              `json:"offset"`
+	Data          []byte             `json:"data"`
+	Mode          uint32             `json:"mode"`
+	CreateParents bool               `json:"create_parents"`
+	Truncate      bool               `json:"truncate"`
+}
+
 type SFTPPushResponse struct {
 	Path         string `json:"path"`
+	BytesWritten int64  `json:"bytes_written"`
+}
+
+type SFTPPushChunkResponse struct {
+	Path         string `json:"path"`
+	Offset       int64  `json:"offset"`
 	BytesWritten int64  `json:"bytes_written"`
 }
 
@@ -129,7 +161,9 @@ type NamespaceService interface {
 	CheckTCPPort(targetIP string, port int) (string, error)
 	SFTPList(req SFTPListRequest) (*SFTPListResponse, error)
 	SFTPFetch(req SFTPFetchRequest) (*SFTPFetchResponse, error)
+	SFTPFetchChunk(req SFTPFetchChunkRequest) (*SFTPFetchChunkResponse, error)
 	SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error)
+	SFTPPushChunk(req SFTPPushChunkRequest) (*SFTPPushChunkResponse, error)
 	SFTPDelete(req SFTPDeleteRequest) (*SFTPDeleteResponse, error)
 	StopHTTP() error
 	Status() (*StatusResponse, error)
@@ -207,8 +241,26 @@ func (s *namespaceServiceRPCServer) SFTPFetch(req SFTPFetchRequest, resp *SFTPFe
 	return nil
 }
 
+func (s *namespaceServiceRPCServer) SFTPFetchChunk(req SFTPFetchChunkRequest, resp *SFTPFetchChunkResponse) error {
+	out, err := s.Impl.SFTPFetchChunk(req)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
 func (s *namespaceServiceRPCServer) SFTPPush(req SFTPPushRequest, resp *SFTPPushResponse) error {
 	out, err := s.Impl.SFTPPush(req)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) SFTPPushChunk(req SFTPPushChunkRequest, resp *SFTPPushChunkResponse) error {
+	out, err := s.Impl.SFTPPushChunk(req)
 	if err != nil {
 		return err
 	}
@@ -272,9 +324,21 @@ func (c *namespaceServiceRPCClient) SFTPFetch(req SFTPFetchRequest) (*SFTPFetchR
 	return &out, err
 }
 
+func (c *namespaceServiceRPCClient) SFTPFetchChunk(req SFTPFetchChunkRequest) (*SFTPFetchChunkResponse, error) {
+	var out SFTPFetchChunkResponse
+	err := c.client.Call("Plugin.SFTPFetchChunk", req, &out)
+	return &out, err
+}
+
 func (c *namespaceServiceRPCClient) SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error) {
 	var out SFTPPushResponse
 	err := c.client.Call("Plugin.SFTPPush", req, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) SFTPPushChunk(req SFTPPushChunkRequest) (*SFTPPushChunkResponse, error) {
+	var out SFTPPushChunkResponse
+	err := c.client.Call("Plugin.SFTPPushChunk", req, &out)
 	return &out, err
 }
 

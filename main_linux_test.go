@@ -32,24 +32,33 @@ import (
 )
 
 type stubNamespaceService struct {
-	describe       *DescribeResponse
-	describeErr    error
-	start          *StartHTTPResponse
-	startErr       error
-	checkTCPOutput string
-	checkTCPErr    error
-	sftpListHook   func(SFTPListRequest) (*SFTPListResponse, error)
-	sftpList       *SFTPListResponse
-	sftpListErr    error
-	sftpFetch      *SFTPFetchResponse
-	sftpFetchErr   error
-	sftpPush       *SFTPPushResponse
-	sftpPushErr    error
-	sftpDelete     *SFTPDeleteResponse
-	sftpDeleteErr  error
-	stopErr        error
-	status         *StatusResponse
-	statusErr      error
+	describe           *DescribeResponse
+	describeErr        error
+	start              *StartHTTPResponse
+	startErr           error
+	checkTCPOutput     string
+	checkTCPErr        error
+	sftpListHook       func(SFTPListRequest) (*SFTPListResponse, error)
+	sftpFetchHook      func(SFTPFetchRequest) (*SFTPFetchResponse, error)
+	sftpFetchChunkHook func(SFTPFetchChunkRequest) (*SFTPFetchChunkResponse, error)
+	sftpPushHook       func(SFTPPushRequest) (*SFTPPushResponse, error)
+	sftpPushChunkHook  func(SFTPPushChunkRequest) (*SFTPPushChunkResponse, error)
+	sftpDeleteHook     func(SFTPDeleteRequest) (*SFTPDeleteResponse, error)
+	sftpList           *SFTPListResponse
+	sftpListErr        error
+	sftpFetch          *SFTPFetchResponse
+	sftpFetchErr       error
+	sftpFetchChunk     *SFTPFetchChunkResponse
+	sftpFetchChunkErr  error
+	sftpPush           *SFTPPushResponse
+	sftpPushErr        error
+	sftpPushChunk      *SFTPPushChunkResponse
+	sftpPushChunkErr   error
+	sftpDelete         *SFTPDeleteResponse
+	sftpDeleteErr      error
+	stopErr            error
+	status             *StatusResponse
+	statusErr          error
 }
 
 func (s *stubNamespaceService) Describe() (*DescribeResponse, error) {
@@ -96,6 +105,9 @@ func (s *stubNamespaceService) SFTPList(req SFTPListRequest) (*SFTPListResponse,
 }
 
 func (s *stubNamespaceService) SFTPFetch(req SFTPFetchRequest) (*SFTPFetchResponse, error) {
+	if s.sftpFetchHook != nil {
+		return s.sftpFetchHook(req)
+	}
 	if s.sftpFetchErr != nil {
 		return nil, s.sftpFetchErr
 	}
@@ -105,7 +117,23 @@ func (s *stubNamespaceService) SFTPFetch(req SFTPFetchRequest) (*SFTPFetchRespon
 	return &SFTPFetchResponse{Path: req.Path}, nil
 }
 
+func (s *stubNamespaceService) SFTPFetchChunk(req SFTPFetchChunkRequest) (*SFTPFetchChunkResponse, error) {
+	if s.sftpFetchChunkHook != nil {
+		return s.sftpFetchChunkHook(req)
+	}
+	if s.sftpFetchChunkErr != nil {
+		return nil, s.sftpFetchChunkErr
+	}
+	if s.sftpFetchChunk != nil {
+		return s.sftpFetchChunk, nil
+	}
+	return &SFTPFetchChunkResponse{Path: req.Path, Offset: req.Offset, EOF: true}, nil
+}
+
 func (s *stubNamespaceService) SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error) {
+	if s.sftpPushHook != nil {
+		return s.sftpPushHook(req)
+	}
 	if s.sftpPushErr != nil {
 		return nil, s.sftpPushErr
 	}
@@ -115,7 +143,23 @@ func (s *stubNamespaceService) SFTPPush(req SFTPPushRequest) (*SFTPPushResponse,
 	return &SFTPPushResponse{Path: req.Path, BytesWritten: int64(len(req.Data))}, nil
 }
 
+func (s *stubNamespaceService) SFTPPushChunk(req SFTPPushChunkRequest) (*SFTPPushChunkResponse, error) {
+	if s.sftpPushChunkHook != nil {
+		return s.sftpPushChunkHook(req)
+	}
+	if s.sftpPushChunkErr != nil {
+		return nil, s.sftpPushChunkErr
+	}
+	if s.sftpPushChunk != nil {
+		return s.sftpPushChunk, nil
+	}
+	return &SFTPPushChunkResponse{Path: req.Path, Offset: req.Offset, BytesWritten: int64(len(req.Data))}, nil
+}
+
 func (s *stubNamespaceService) SFTPDelete(req SFTPDeleteRequest) (*SFTPDeleteResponse, error) {
+	if s.sftpDeleteHook != nil {
+		return s.sftpDeleteHook(req)
+	}
 	if s.sftpDeleteErr != nil {
 		return nil, s.sftpDeleteErr
 	}
@@ -180,8 +224,16 @@ func (s *delayedNamespaceService) SFTPFetch(req SFTPFetchRequest) (*SFTPFetchRes
 	return &SFTPFetchResponse{Path: req.Path}, nil
 }
 
+func (s *delayedNamespaceService) SFTPFetchChunk(req SFTPFetchChunkRequest) (*SFTPFetchChunkResponse, error) {
+	return &SFTPFetchChunkResponse{Path: req.Path, Offset: req.Offset, EOF: true}, nil
+}
+
 func (s *delayedNamespaceService) SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error) {
 	return &SFTPPushResponse{Path: req.Path, BytesWritten: int64(len(req.Data))}, nil
+}
+
+func (s *delayedNamespaceService) SFTPPushChunk(req SFTPPushChunkRequest) (*SFTPPushChunkResponse, error) {
+	return &SFTPPushChunkResponse{Path: req.Path, Offset: req.Offset, BytesWritten: int64(len(req.Data))}, nil
 }
 
 func (s *delayedNamespaceService) SFTPDelete(req SFTPDeleteRequest) (*SFTPDeleteResponse, error) {
@@ -427,9 +479,22 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 			Mode:        0o100644,
 			ModTimeUnix: 1234,
 		},
+		sftpFetchChunk: &SFTPFetchChunkResponse{
+			Path:      "/demo.txt",
+			Offset:    2,
+			Data:      []byte("mo"),
+			EOF:       true,
+			TotalSize: 4,
+			Mode:      0o100644,
+		},
 		sftpPush: &SFTPPushResponse{
 			Path:         "/upload/demo.txt",
 			BytesWritten: 5,
+		},
+		sftpPushChunk: &SFTPPushChunkResponse{
+			Path:         "/upload/demo.txt",
+			Offset:       2,
+			BytesWritten: 2,
 		},
 		sftpDelete: &SFTPDeleteResponse{
 			Path:    "/upload/demo.txt",
@@ -498,12 +563,28 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 		t.Fatalf("unexpected SFTPFetch response: %+v", fetch)
 	}
 
+	var fetchChunk SFTPFetchChunkResponse
+	if err := server.SFTPFetchChunk(SFTPFetchChunkRequest{Path: "/demo.txt", Offset: 2, Length: 2}, &fetchChunk); err != nil {
+		t.Fatalf("SFTPFetchChunk failed: %v", err)
+	}
+	if fetchChunk.Path != "/demo.txt" || fetchChunk.Offset != 2 || string(fetchChunk.Data) != "mo" || !fetchChunk.EOF {
+		t.Fatalf("unexpected SFTPFetchChunk response: %+v", fetchChunk)
+	}
+
 	var push SFTPPushResponse
 	if err := server.SFTPPush(SFTPPushRequest{Path: "/upload/demo.txt", Data: []byte("hello")}, &push); err != nil {
 		t.Fatalf("SFTPPush failed: %v", err)
 	}
 	if push.Path != "/upload/demo.txt" || push.BytesWritten != 5 {
 		t.Fatalf("unexpected SFTPPush response: %+v", push)
+	}
+
+	var pushChunk SFTPPushChunkResponse
+	if err := server.SFTPPushChunk(SFTPPushChunkRequest{Path: "/upload/demo.txt", Offset: 2, Data: []byte("lo")}, &pushChunk); err != nil {
+		t.Fatalf("SFTPPushChunk failed: %v", err)
+	}
+	if pushChunk.Path != "/upload/demo.txt" || pushChunk.Offset != 2 || pushChunk.BytesWritten != 2 {
+		t.Fatalf("unexpected SFTPPushChunk response: %+v", pushChunk)
 	}
 
 	var del SFTPDeleteResponse
@@ -625,7 +706,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 
 func TestStartHostDashboardAndRunHost(t *testing.T) {
 	t.Run("dashboard server", func(t *testing.T) {
-		server, addr, err := startHostDashboard("127.0.0.1:0", "eth0", "/var/lib/netforge", nil)
+		server, addr, err := startHostDashboard("127.0.0.1:0", "eth0", "/var/lib/netforge", nil, nil)
 		if err != nil {
 			t.Fatalf("startHostDashboard failed: %v", err)
 		}
