@@ -605,8 +605,10 @@ func startPlugin(selfBin string, runtimeBase string, cfg NSConfig) (*pluginProc,
 		RunnerFunc: func(_ hclog.Logger, cmd *exec.Cmd, _ string) (runner.Runner, error) {
 			cmd.Path = selfBin
 			cmd.Args = []string{selfBin}
+			// Preserve cmd.Env set by go-plugin (contains the magic cookie) and
+			// append our own variables on top.
 			cmd.Env = append(
-				os.Environ(),
+				cmd.Env,
 				"NS_PLUGIN_MODE=1",
 				"NS_PLUGIN_CONFIG="+pluginConfigJSON(cfg),
 			)
