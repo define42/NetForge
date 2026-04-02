@@ -20,7 +20,7 @@ The whole project currently lives in `main.go` plus a few Linux-only support fil
 
 ## Build And Test
 
-- Build: `make build` or `go build -o netforge`
+- Build: `make build` or `CGO_ENABLED=0 go build -o netforge`
 - Run tests: `make test`
 - Run the app: `make run`
 
@@ -29,6 +29,7 @@ Important constraints:
 - The real integration paths require Linux and root.
 - `make test` runs `sudo go test -cover`.
 - `go test ./...` is still useful for fast non-root iteration, but it does not exercise all namespace and firewall behavior.
+- Keep the shipped binary pure-Go (`CGO_ENABLED=0`). The sandbox seccomp policy blocks broad `clone3`/process creation, so cgo-enabled plugin children can fail at runtime when libc tries to start threads.
 
 ## Runtime Configuration
 

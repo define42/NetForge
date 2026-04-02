@@ -6,9 +6,9 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -17,16 +17,33 @@ import (
 )
 
 type fakePluginCgroup struct {
-	path      string
-	addedPIDs []uint64
-	addErr    error
-	killed    bool
-	deleted   bool
+	path         string
+	configureErr error
+	configured   bool
+	useCgroupFD  bool
+	cgroupFD     int
+	killed       bool
+	deleted      bool
+	closed       bool
 }
 
-func (f *fakePluginCgroup) AddProc(pid uint64) error {
-	f.addedPIDs = append(f.addedPIDs, pid)
-	return f.addErr
+func (f *fakePluginCgroup) ConfigureCommand(cmd *exec.Cmd) error {
+	if f.configureErr != nil {
+		return f.configureErr
+	}
+	f.configured = true
+	if cmd != nil {
+		attr := cmd.SysProcAttr
+		if attr == nil {
+			attr = &syscall.SysProcAttr{}
+		}
+		attr.UseCgroupFD = true
+		attr.CgroupFD = 42
+		cmd.SysProcAttr = attr
+		f.useCgroupFD = attr.UseCgroupFD
+		f.cgroupFD = attr.CgroupFD
+	}
+	return nil
 }
 
 func (f *fakePluginCgroup) Kill() error {
@@ -36,6 +53,11 @@ func (f *fakePluginCgroup) Kill() error {
 
 func (f *fakePluginCgroup) Delete() error {
 	f.deleted = true
+	return nil
+}
+
+func (f *fakePluginCgroup) Close() error {
+	f.closed = true
 	return nil
 }
 
@@ -50,6 +72,7 @@ func resetPluginCgroupTestHooks(t *testing.T) {
 	nested := pluginCgroupNestedGroupPath
 	newManager := pluginCgroupNewManager
 	now := pluginCgroupNow
+	openDir := pluginCgroupOpenDir
 	factory := pluginCgroupFactory
 
 	t.Cleanup(func() {
@@ -57,6 +80,7 @@ func resetPluginCgroupTestHooks(t *testing.T) {
 		pluginCgroupNestedGroupPath = nested
 		pluginCgroupNewManager = newManager
 		pluginCgroupNow = now
+		pluginCgroupOpenDir = openDir
 		pluginCgroupFactory = factory
 	})
 }
@@ -81,14 +105,23 @@ func TestNewPluginCgroup(t *testing.T) {
 		resources = res
 		return &cgroup2.Manager{}, nil
 	}
+	pluginCgroupOpenDir = func(path string) (*os.File, error) {
+		if want := pluginCgroupDirPath(group); path != want {
+			t.Fatalf("unexpected cgroup dir path: got %q want %q", path, want)
+		}
+		return os.Open(t.TempDir())
+	}
 
 	cgroup, err := newPluginCgroup("ns /with spaces")
 	if err != nil {
 		t.Fatalf("newPluginCgroup failed: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = cgroup.Close()
+	})
 
 	wantLeaf := "ns-with-spaces"
-	if !strings.HasPrefix(suffix, pluginCgroupPrefix+"/") {
+	if !strings.HasPrefix(suffix, pluginCgroupPrefix+"-") {
 		t.Fatalf("unexpected cgroup suffix: %q", suffix)
 	}
 	if !strings.Contains(suffix, wantLeaf) {
@@ -103,8 +136,27 @@ func TestNewPluginCgroup(t *testing.T) {
 	if resources == nil {
 		t.Fatal("expected cgroup resources to be set")
 	}
-	if resources.CPU != nil || resources.Memory != nil || resources.Pids != nil || len(resources.Devices) != 0 {
-		t.Fatalf("expected empty cgroup resources, got %+v", resources)
+	if resources.CPU == nil || resources.Memory == nil || resources.Pids == nil {
+		t.Fatalf("expected cpu, memory, and pids resources, got %+v", resources)
+	}
+	if resources.Pids.Max != pluginCgroupPidsMax {
+		t.Fatalf("unexpected pids.max: got %d want %d", resources.Pids.Max, pluginCgroupPidsMax)
+	}
+	if resources.Memory.Max == nil || *resources.Memory.Max != pluginCgroupMemoryMaxBytes {
+		t.Fatalf("unexpected memory.max: got %+v want %d", resources.Memory.Max, pluginCgroupMemoryMaxBytes)
+	}
+	if resources.Memory.OOMGroup == nil || !*resources.Memory.OOMGroup {
+		t.Fatalf("expected oom.group to be enabled, got %+v", resources.Memory.OOMGroup)
+	}
+	wantCPUMax := cgroup2.NewCPUMax(func() *int64 {
+		v := int64(pluginCgroupCPUQuotaMicros)
+		return &v
+	}(), func() *uint64 {
+		v := uint64(pluginCgroupCPUPeriodMicros)
+		return &v
+	}())
+	if resources.CPU.Max != wantCPUMax {
+		t.Fatalf("unexpected cpu.max: got %q want %q", resources.CPU.Max, wantCPUMax)
 	}
 }
 
@@ -121,57 +173,92 @@ func TestCleanupPluginCgroup(t *testing.T) {
 	fake := &fakePluginCgroup{}
 	cleanupPluginCgroup(fake)
 
-	if !fake.killed || !fake.deleted {
+	if !fake.closed || !fake.killed || !fake.deleted {
 		t.Fatalf("expected cleanup to kill and delete cgroup, got %+v", fake)
 	}
 
 	cleanupPluginCgroup(nil)
 }
 
-func TestNamespaceCmdRunnerAttachToCgroup(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		cmd := exec.Command("sleep", "30")
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("cmd.Start failed: %v", err)
-		}
-		defer func() {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-		}()
-
-		fake := &fakePluginCgroup{path: "/netforge/test"}
-		runner := &namespaceCmdRunner{cmd: cmd, cgroup: fake}
-
-		if err := runner.attachToCgroup(); err != nil {
-			t.Fatalf("attachToCgroup failed: %v", err)
-		}
-		if !slices.Equal(fake.addedPIDs, []uint64{uint64(cmd.Process.Pid)}) {
-			t.Fatalf("unexpected cgroup add pid calls: %+v", fake.addedPIDs)
-		}
-		if fake.killed || fake.deleted {
-			t.Fatalf("did not expect cleanup on successful attach: %+v", fake)
-		}
+func TestManagedPluginCgroupConfigureCommand(t *testing.T) {
+	file, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open temp dir failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = file.Close()
 	})
 
-	t.Run("failure cleans up", func(t *testing.T) {
-		cmd := exec.Command("sleep", "30")
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("cmd.Start failed: %v", err)
-		}
+	cmd := exec.Command("true")
+	cgroup := &managedPluginCgroup{
+		path: "/netforge/test",
+		dir:  file,
+	}
 
-		fake := &fakePluginCgroup{
-			path:   "/netforge/test",
-			addErr: errors.New("boom"),
-		}
-		runner := &namespaceCmdRunner{cmd: cmd, cgroup: fake}
+	if err := cgroup.ConfigureCommand(cmd); err != nil {
+		t.Fatalf("ConfigureCommand failed: %v", err)
+	}
+	if cmd.SysProcAttr == nil {
+		t.Fatal("expected SysProcAttr to be configured")
+	}
+	if !cmd.SysProcAttr.UseCgroupFD {
+		t.Fatal("expected UseCgroupFD=true")
+	}
+	if got, want := cmd.SysProcAttr.CgroupFD, int(file.Fd()); got != want {
+		t.Fatalf("unexpected CgroupFD: got %d want %d", got, want)
+	}
+}
 
-		if err := runner.attachToCgroup(); err == nil {
-			t.Fatal("expected attachToCgroup to fail")
-		}
-		if !fake.killed || !fake.deleted {
-			t.Fatalf("expected cleanup on failed attach: %+v", fake)
-		}
-	})
+func TestNewNamespaceCmdRunnerConfiguresCgroupBeforeStart(t *testing.T) {
+	resetPluginCgroupTestHooks(t)
+
+	fake := &fakePluginCgroup{path: "/netforge/test"}
+	pluginCgroupFactory = func(namespace string) (pluginCgroup, error) {
+		return fake, nil
+	}
+
+	cmd := exec.Command("true")
+	runner, err := newNamespaceCmdRunner(nil, cmd, "ns1", pluginSandboxSpec{})
+	if err != nil {
+		t.Fatalf("newNamespaceCmdRunner failed: %v", err)
+	}
+	_ = runner
+
+	if !fake.configured {
+		t.Fatal("expected cgroup to configure command before start")
+	}
+	if !fake.useCgroupFD {
+		t.Fatal("expected cgroup to set UseCgroupFD")
+	}
+	if fake.cgroupFD == 0 {
+		t.Fatal("expected cgroup to set a non-zero cgroup fd")
+	}
+	if cmd.SysProcAttr == nil {
+		t.Fatal("expected SysProcAttr to be set")
+	}
+	if want := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWPID); cmd.SysProcAttr.Cloneflags&want != want {
+		t.Fatalf("expected sandbox clone flags to remain set, got %#x want mask %#x", cmd.SysProcAttr.Cloneflags, want)
+	}
+}
+
+func TestNewNamespaceCmdRunnerCgroupConfigureFailureCleansUp(t *testing.T) {
+	resetPluginCgroupTestHooks(t)
+
+	fake := &fakePluginCgroup{
+		path:         "/netforge/test",
+		configureErr: errors.New("boom"),
+	}
+	pluginCgroupFactory = func(namespace string) (pluginCgroup, error) {
+		return fake, nil
+	}
+
+	cmd := exec.Command("true")
+	if _, err := newNamespaceCmdRunner(nil, cmd, "ns1", pluginSandboxSpec{}); err == nil {
+		t.Fatal("expected newNamespaceCmdRunner to fail")
+	}
+	if !fake.closed || !fake.killed || !fake.deleted {
+		t.Fatalf("expected cleanup on failed cgroup configuration: %+v", fake)
+	}
 }
 
 func TestRunningPluginStopCleansUpCgroup(t *testing.T) {
@@ -184,7 +271,7 @@ func TestRunningPluginStopCleansUpCgroup(t *testing.T) {
 	}
 	proc.Stop()
 
-	if !fake.killed || !fake.deleted {
+	if !fake.closed || !fake.killed || !fake.deleted {
 		t.Fatalf("expected Stop to clean up cgroup, got %+v", fake)
 	}
 	if proc.cgroup != nil {
@@ -222,7 +309,7 @@ func TestPluginCgroupLeafIncludesPidAndTime(t *testing.T) {
 	}
 
 	leaf := pluginCgroupLeaf("ns1")
-	if !strings.HasPrefix(leaf, "ns1-") {
+	if !strings.HasPrefix(leaf, pluginCgroupPrefix+"-ns1-") {
 		t.Fatalf("unexpected cgroup leaf prefix: %q", leaf)
 	}
 	if !strings.Contains(leaf, "-123000000456") {

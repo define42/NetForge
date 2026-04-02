@@ -46,6 +46,11 @@ var pluginSandboxReadonlyBindMounts = []string{
 	"/usr/lib64",
 }
 
+const (
+	pluginSandboxAllowedCloneRequiredFlags = unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES | unix.CLONE_SIGHAND | unix.CLONE_THREAD
+	pluginSandboxDisallowedCloneFlags      = unix.CLONE_NEWCGROUP | unix.CLONE_NEWIPC | unix.CLONE_NEWNET | unix.CLONE_NEWNS | unix.CLONE_NEWPID | unix.CLONE_NEWUSER | unix.CLONE_NEWUTS
+)
+
 var (
 	pluginSandboxMount     = unix.Mount
 	pluginSandboxPivotRoot = unix.PivotRoot
@@ -474,8 +479,6 @@ func pluginSandboxSeccompFilter() seccomp.Filter {
 						"brk",
 						"clock_gettime",
 						"clock_nanosleep",
-						"clone",
-						"clone3",
 						"close",
 						"connect",
 						"dup",
@@ -549,6 +552,23 @@ func pluginSandboxSeccompFilter() seccomp.Filter {
 						"unlinkat",
 						"write",
 						"writev",
+					},
+					NamesWithCondtions: []seccomp.NameWithConditions{
+						{
+							Name: "clone",
+							Conditions: seccomp.ArgumentConditions{
+								{
+									Argument:  0,
+									Operation: seccomp.BitsSet,
+									Value:     uint64(pluginSandboxAllowedCloneRequiredFlags),
+								},
+								{
+									Argument:  0,
+									Operation: seccomp.BitsNotSet,
+									Value:     uint64(pluginSandboxDisallowedCloneFlags),
+								},
+							},
+						},
 					},
 				},
 			},

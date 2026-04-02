@@ -226,6 +226,10 @@ func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string,
 	if err != nil {
 		return nil, err
 	}
+	if err := cgroup.ConfigureCommand(cmd); err != nil {
+		cleanupPluginCgroup(cgroup)
+		return nil, err
+	}
 
 	displayPath := cmd.Path
 	if len(cmd.Args) > 0 && cmd.Args[0] != "" {
@@ -256,25 +260,7 @@ func (r *namespaceCmdRunner) Start(_ context.Context) error {
 	}
 
 	r.pid = r.cmd.Process.Pid
-	if err := r.attachToCgroup(); err != nil {
-		return err
-	}
 	r.logger.Debug("plugin started", "path", r.path, "pid", r.pid, "namespace", r.namespace, "cgroup", cgroupPath)
-	return nil
-}
-
-func (r *namespaceCmdRunner) attachToCgroup() error {
-	if r.cgroup == nil || r.cmd == nil || r.cmd.Process == nil {
-		return nil
-	}
-
-	pid := uint64(r.cmd.Process.Pid)
-	if err := r.cgroup.AddProc(pid); err != nil {
-		_ = r.cmd.Process.Kill()
-		_ = r.cmd.Wait()
-		cleanupPluginCgroup(r.cgroup)
-		return fmt.Errorf("add plugin pid %d to cgroup %q: %w", pid, r.cgroup.Path(), err)
-	}
 	return nil
 }
 

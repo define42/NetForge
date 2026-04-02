@@ -943,7 +943,7 @@ func buildPackageBinary(t *testing.T) string {
 	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, ".")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("go build failed: %v", err)
 	}

@@ -242,11 +242,43 @@ func TestPluginSandboxSeccompFilterDefinition(t *testing.T) {
 	if len(filter.Policy.Syscalls) != 1 {
 		t.Fatalf("unexpected syscall group count: %d", len(filter.Policy.Syscalls))
 	}
-	names := filter.Policy.Syscalls[0].Names
+	group := filter.Policy.Syscalls[0]
+	names := group.Names
 	for _, want := range []string{"socket", "setsockopt", "read", "write", "exit_group"} {
 		if !slices.Contains(names, want) {
 			t.Fatalf("seccomp policy missing syscall %q", want)
 		}
+	}
+	if slices.Contains(names, "clone") {
+		t.Fatal("seccomp policy should not allow clone without argument filters")
+	}
+	if slices.Contains(names, "clone3") {
+		t.Fatal("seccomp policy should not allow clone3")
+	}
+	if len(group.NamesWithCondtions) != 1 {
+		t.Fatalf("unexpected conditional syscall count: %d", len(group.NamesWithCondtions))
+	}
+	entry := group.NamesWithCondtions[0]
+	if entry.Name != "clone" {
+		t.Fatalf("unexpected conditional syscall name: %q", entry.Name)
+	}
+	if len(entry.Conditions) != 2 {
+		t.Fatalf("unexpected clone condition count: %d", len(entry.Conditions))
+	}
+	var sawRequired, sawForbidden bool
+	for _, cond := range entry.Conditions {
+		switch {
+		case cond.Argument == 0 && cond.Operation == seccomp.BitsSet && cond.Value == uint64(pluginSandboxAllowedCloneRequiredFlags):
+			sawRequired = true
+		case cond.Argument == 0 && cond.Operation == seccomp.BitsNotSet && cond.Value == uint64(pluginSandboxDisallowedCloneFlags):
+			sawForbidden = true
+		}
+	}
+	if !sawRequired {
+		t.Fatalf("seccomp policy missing required clone flag mask %#x", uint64(pluginSandboxAllowedCloneRequiredFlags))
+	}
+	if !sawForbidden {
+		t.Fatalf("seccomp policy missing forbidden clone flag mask %#x", uint64(pluginSandboxDisallowedCloneFlags))
 	}
 }
 
@@ -830,6 +862,7 @@ func assertPluginSandboxed(t *testing.T, proc *runningPlugin) {
 	if got := readUnifiedProcCgroupPath(t, proc.pid); got != proc.cgroup.Path() {
 		t.Fatalf("sandbox cgroup mismatch: got %q want %q", got, proc.cgroup.Path())
 	}
+	assertPluginCgroupLimits(t, proc.cgroup.Path())
 
 	status := readProcStatus(t, proc.pid)
 	if status["NoNewPrivs"] != "1" {
@@ -949,6 +982,32 @@ func readUnifiedProcCgroupPath(t *testing.T, pid int) string {
 	}
 	t.Fatalf("did not find unified cgroup entry in /proc/%d/cgroup", pid)
 	return ""
+}
+
+func assertPluginCgroupLimits(t *testing.T, groupPath string) {
+	t.Helper()
+
+	base := filepath.Join(pluginCgroupMountpoint, strings.TrimPrefix(groupPath, "/"))
+	if got := mustReadTrimmedFile(t, filepath.Join(base, "pids.max")); got != fmt.Sprintf("%d", pluginCgroupPidsMax) {
+		t.Fatalf("unexpected pids.max: got %q want %d", got, pluginCgroupPidsMax)
+	}
+	if got := mustReadTrimmedFile(t, filepath.Join(base, "memory.max")); got != fmt.Sprintf("%d", pluginCgroupMemoryMaxBytes) {
+		t.Fatalf("unexpected memory.max: got %q want %d", got, pluginCgroupMemoryMaxBytes)
+	}
+	wantCPUMax := fmt.Sprintf("%d %d", pluginCgroupCPUQuotaMicros, pluginCgroupCPUPeriodMicros)
+	if got := mustReadTrimmedFile(t, filepath.Join(base, "cpu.max")); got != wantCPUMax {
+		t.Fatalf("unexpected cpu.max: got %q want %q", got, wantCPUMax)
+	}
+}
+
+func mustReadTrimmedFile(t *testing.T, path string) string {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s failed: %v", path, err)
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func mustReadlink(t *testing.T, path string) string {

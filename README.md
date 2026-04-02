@@ -44,7 +44,7 @@ make build
 Or:
 
 ```bash
-go build -o netforge
+CGO_ENABLED=0 go build -o netforge
 ```
 
 ## Test
@@ -60,6 +60,8 @@ sudo go test -cover
 ```
 
 Many integration paths require Linux and root. `go test ./...` is useful for fast iteration, but it does not cover the full namespace lifecycle.
+
+Build the NetForge binary with `CGO_ENABLED=0`. The plugin sandbox intentionally blocks broad `clone3`/process creation paths, so shipping a cgo-enabled binary can break thread startup inside the sandbox.
 
 ## Run
 
