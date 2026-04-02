@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -20,7 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/go-plugin/runner"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
@@ -269,6 +272,95 @@ type runningPlugin struct {
 	rpc    NamespaceService
 }
 
+type namespaceCmdRunner struct {
+	logger    hclog.Logger
+	cmd       *exec.Cmd
+	namespace string
+
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+	path   string
+	pid    int
+}
+
+func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string) (*namespaceCmdRunner, error) {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	return &namespaceCmdRunner{
+		logger:    logger,
+		cmd:       cmd,
+		namespace: namespace,
+		stdout:    stdout,
+		stderr:    stderr,
+		path:      cmd.Path,
+	}, nil
+}
+
+func (r *namespaceCmdRunner) Start(_ context.Context) error {
+	r.logger.Debug("starting plugin", "path", r.cmd.Path, "args", r.cmd.Args, "namespace", r.namespace)
+	if err := startCmdInNamedNamespace(r.cmd, r.namespace); err != nil {
+		return err
+	}
+
+	r.pid = r.cmd.Process.Pid
+	r.logger.Debug("plugin started", "path", r.path, "pid", r.pid, "namespace", r.namespace)
+	return nil
+}
+
+func (r *namespaceCmdRunner) Wait(_ context.Context) error {
+	return r.cmd.Wait()
+}
+
+func (r *namespaceCmdRunner) Kill(_ context.Context) error {
+	if r.cmd.Process == nil {
+		return nil
+	}
+
+	err := r.cmd.Process.Kill()
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
+}
+
+func (r *namespaceCmdRunner) Stdout() io.ReadCloser {
+	return r.stdout
+}
+
+func (r *namespaceCmdRunner) Stderr() io.ReadCloser {
+	return r.stderr
+}
+
+func (r *namespaceCmdRunner) Name() string {
+	return r.path
+}
+
+func (r *namespaceCmdRunner) ID() string {
+	return fmt.Sprintf("%d", r.pid)
+}
+
+func (r *namespaceCmdRunner) Diagnose(_ context.Context) string {
+	return fmt.Sprintf("failed to start %s in network namespace %q", r.path, r.namespace)
+}
+
+func (r *namespaceCmdRunner) PluginToHost(pluginNet, pluginAddr string) (string, string, error) {
+	return pluginNet, pluginAddr, nil
+}
+
+func (r *namespaceCmdRunner) HostToPlugin(hostNet, hostAddr string) (string, string, error) {
+	return hostNet, hostAddr, nil
+}
+
+var _ runner.Runner = (*namespaceCmdRunner)(nil)
+
 func (p *runningPlugin) Stop() {
 	if p == nil {
 		return
@@ -279,6 +371,49 @@ func (p *runningPlugin) Stop() {
 	if p.client != nil {
 		p.client.Kill()
 	}
+}
+
+func startCmdInNamedNamespace(cmd *exec.Cmd, namespace string) (err error) {
+	ns, err := netns.GetFromName(namespace)
+	if err != nil {
+		return fmt.Errorf("lookup namespace %q: %w", namespace, err)
+	}
+	defer ns.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	original, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("get current namespace: %w", err)
+	}
+	defer original.Close()
+
+	if err := netns.Set(ns); err != nil {
+		return fmt.Errorf("enter namespace %q: %w", namespace, err)
+	}
+
+	started := false
+	defer func() {
+		restoreErr := netns.Set(original)
+		if restoreErr == nil {
+			return
+		}
+		if started && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		if err == nil {
+			err = fmt.Errorf("restore original namespace after starting %q: %w", namespace, restoreErr)
+		}
+	}()
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	started = true
+
+	return nil
 }
 
 func envDefault(key, fallback string) string {
@@ -553,7 +688,7 @@ func setupNamespaceNetwork(parentNIC string, cfg NSConfig) (netns.NsHandle, erro
 	return ns, nil
 }
 
-func startNamespacePlugin(selfBinary, ipCmd, runtimeBase string, cfg NSConfig) (*runningPlugin, error) {
+func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runningPlugin, error) {
 	runtimeDir := filepath.Join(runtimeBase, cfg.Name)
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create runtime dir %q: %w", runtimeDir, err)
@@ -564,16 +699,18 @@ func startNamespacePlugin(selfBinary, ipCmd, runtimeBase string, cfg NSConfig) (
 		return nil, err
 	}
 
-	cmd := exec.Command(ipCmd, "netns", "exec", cfg.Name, selfBinary)
-	cmd.Env = append(os.Environ(),
-		"NS_PLUGIN_MODE=1",
-		"NS_PLUGIN_CONFIG="+cfgJSON,
-	)
-
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig: handshake,
 		Plugins:         pluginMap,
-		Cmd:             cmd,
+		RunnerFunc: func(logger hclog.Logger, cmd *exec.Cmd, _ string) (runner.Runner, error) {
+			cmd.Path = selfBinary
+			cmd.Args = []string{selfBinary}
+			cmd.Env = append(cmd.Env,
+				"NS_PLUGIN_MODE=1",
+				"NS_PLUGIN_CONFIG="+cfgJSON,
+			)
+			return newNamespaceCmdRunner(logger, cmd, cfg.Name)
+		},
 		AllowedProtocols: []plugin.Protocol{
 			plugin.ProtocolNetRPC,
 		},
@@ -612,7 +749,7 @@ func startNamespacePlugin(selfBinary, ipCmd, runtimeBase string, cfg NSConfig) (
 	return &runningPlugin{cfg: cfg, client: client, rpc: svc}, nil
 }
 
-func runHost(ctx context.Context, parentNIC, selfBinary, ipCmd, runtimeBase string, configs []NSConfig) error {
+func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase string, configs []NSConfig) error {
 	plugins := make([]*runningPlugin, 0, len(configs))
 	defer func() {
 		for _, p := range plugins {
@@ -627,7 +764,7 @@ func runHost(ctx context.Context, parentNIC, selfBinary, ipCmd, runtimeBase stri
 		}
 		_ = ns.Close()
 
-		rp, err := startNamespacePlugin(selfBinary, ipCmd, runtimeBase, cfg)
+		rp, err := startNamespacePlugin(selfBinary, runtimeBase, cfg)
 		if err != nil {
 			return err
 		}
@@ -678,11 +815,6 @@ func runMain() error {
 		return err
 	}
 
-	ipCmd, err := exec.LookPath("ip")
-	if err != nil {
-		return fmt.Errorf("find ip command: %w", err)
-	}
-
 	parentNIC := envDefault("PARENT_NIC", "eth0")
 	runtimeBase := envDefault("PLUGIN_RUNTIME_BASE", "./netforge")
 
@@ -694,7 +826,7 @@ func runMain() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	return runHost(ctx, parentNIC, selfBinary, ipCmd, runtimeBase, configs)
+	return runHost(ctx, parentNIC, selfBinary, runtimeBase, configs)
 }
 
 func main() {

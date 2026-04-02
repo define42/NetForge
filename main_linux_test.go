@@ -361,11 +361,6 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 	requireIntegration(t)
 
-	ipCmd, err := exec.LookPath("ip")
-	if err != nil {
-		t.Skip("ip command not found")
-	}
-
 	parentName := "dmy200"
 	nsName := "tns200"
 	cfg := NSConfig{
@@ -401,7 +396,7 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 	}
 
 	bin := buildPackageBinary(t)
-	proc, err := startNamespacePlugin(bin, ipCmd, t.TempDir(), cfg)
+	proc, err := startNamespacePlugin(bin, t.TempDir(), cfg)
 	if err != nil {
 		t.Fatalf("startNamespacePlugin failed: %v", err)
 	}
