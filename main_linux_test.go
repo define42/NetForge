@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,9 @@ import (
 type stubNamespaceService struct {
 	describe    *DescribeResponse
 	describeErr error
+	start       *StartHTTPResponse
+	startErr    error
+	stopErr     error
 	status      *StatusResponse
 	statusErr   error
 }
@@ -47,10 +51,19 @@ func (s *stubNamespaceService) Describe() (*DescribeResponse, error) {
 }
 
 func (s *stubNamespaceService) StartHTTP(port int) (*StartHTTPResponse, error) {
+	if s.startErr != nil {
+		return nil, s.startErr
+	}
+	if s.start != nil {
+		return s.start, nil
+	}
 	return &StartHTTPResponse{HTTPAddr: fmt.Sprintf(":%d", port)}, nil
 }
 
 func (s *stubNamespaceService) StopHTTP() error {
+	if s.stopErr != nil {
+		return s.stopErr
+	}
 	return nil
 }
 
@@ -111,6 +124,134 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConfigHelpers(t *testing.T) {
+	t.Run("envDefault", func(t *testing.T) {
+		if got := envDefault("NETFORGE_TEST_ENV_DEFAULT", "fallback"); got != "fallback" {
+			t.Fatalf("unexpected fallback value: got %q want %q", got, "fallback")
+		}
+
+		t.Setenv("NETFORGE_TEST_ENV_DEFAULT", "present")
+		if got := envDefault("NETFORGE_TEST_ENV_DEFAULT", "fallback"); got != "present" {
+			t.Fatalf("unexpected env value: got %q want %q", got, "present")
+		}
+	})
+
+	t.Run("defaultConfigs", func(t *testing.T) {
+		cfgs := defaultConfigs("eth9")
+		if len(cfgs) != 2 {
+			t.Fatalf("unexpected default config count: got %d want %d", len(cfgs), 2)
+		}
+		if cfgs[0].IfName != "eth9.1" || cfgs[1].IfName != "eth9.2" {
+			t.Fatalf("unexpected default interfaces: %+v", cfgs)
+		}
+		if cfgs[0].OpenPort != cfgs[0].ListenPort || cfgs[1].OpenPort != cfgs[1].ListenPort {
+			t.Fatalf("expected default open ports to match listen ports: %+v", cfgs)
+		}
+	})
+
+	t.Run("loadConfigs default", func(t *testing.T) {
+		t.Setenv("NS_CONFIG_JSON", "")
+		cfgs, err := loadConfigs("eth7")
+		if err != nil {
+			t.Fatalf("loadConfigs default failed: %v", err)
+		}
+		if len(cfgs) != 2 || cfgs[0].IfName != "eth7.1" || cfgs[1].IfName != "eth7.2" {
+			t.Fatalf("unexpected default configs: %+v", cfgs)
+		}
+	})
+
+	t.Run("loadConfigs custom", func(t *testing.T) {
+		t.Setenv("NS_CONFIG_JSON", `[{"name":"nsx","listen_port":8088,"allow_icmp":true}]`)
+		cfgs, err := loadConfigs("ignored0")
+		if err != nil {
+			t.Fatalf("loadConfigs custom failed: %v", err)
+		}
+		if len(cfgs) != 1 {
+			t.Fatalf("unexpected config count: got %d want %d", len(cfgs), 1)
+		}
+		if cfgs[0].OpenPort != 8088 {
+			t.Fatalf("expected open_port default from listen_port: %+v", cfgs[0])
+		}
+		if !cfgs[0].AllowICMP {
+			t.Fatalf("expected allow_icmp=true: %+v", cfgs[0])
+		}
+	})
+
+	t.Run("loadConfigs invalid", func(t *testing.T) {
+		t.Setenv("NS_CONFIG_JSON", `not-json`)
+		if _, err := loadConfigs("eth0"); err == nil {
+			t.Fatal("expected invalid json error")
+		}
+	})
+
+	t.Run("loadConfigs empty", func(t *testing.T) {
+		t.Setenv("NS_CONFIG_JSON", `[]`)
+		if _, err := loadConfigs("eth0"); err == nil {
+			t.Fatal("expected empty config error")
+		}
+	})
+}
+
+func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
+	stub := &stubNamespaceService{
+		describe: &DescribeResponse{
+			Namespace: "ns-rpc",
+			HTTPAddr:  ":19090",
+			Message:   "plugin ready",
+		},
+		start: &StartHTTPResponse{HTTPAddr: ":19090"},
+		status: &StatusResponse{
+			Namespace:   "ns-rpc",
+			Interface:   "eth0.42",
+			IPCIDR:      "192.0.2.10/24",
+			MAC:         "02:00:00:00:42:42",
+			Gateway:     "192.0.2.1",
+			OpenPort:    19090,
+			AllowICMP:   true,
+			HTTPAddr:    ":19090",
+			HTTPRunning: true,
+		},
+	}
+
+	raw, err := (&namespaceServicePlugin{Impl: stub}).Server(nil)
+	if err != nil {
+		t.Fatalf("Server failed: %v", err)
+	}
+
+	server, ok := raw.(*namespaceServiceRPCServer)
+	if !ok {
+		t.Fatalf("unexpected server type: %T", raw)
+	}
+
+	var describe DescribeResponse
+	if err := server.Describe(struct{}{}, &describe); err != nil {
+		t.Fatalf("Describe failed: %v", err)
+	}
+	if describe.Namespace != "ns-rpc" || describe.HTTPAddr != ":19090" {
+		t.Fatalf("unexpected describe response: %+v", describe)
+	}
+
+	var start StartHTTPResponse
+	if err := server.StartHTTP(19090, &start); err != nil {
+		t.Fatalf("StartHTTP failed: %v", err)
+	}
+	if start.HTTPAddr != ":19090" {
+		t.Fatalf("unexpected start response: %+v", start)
+	}
+
+	if err := server.StopHTTP(struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("StopHTTP failed: %v", err)
+	}
+
+	var status StatusResponse
+	if err := server.Status(struct{}{}, &status); err != nil {
+		t.Fatalf("Status failed: %v", err)
+	}
+	if status.Namespace != "ns-rpc" || !status.HTTPRunning || !status.AllowICMP {
+		t.Fatalf("unexpected status response: %+v", status)
+	}
+}
+
 func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	svc := &namespaceHTTPService{cfg: PluginConfig{
 		Namespace: "ns-test",
@@ -122,12 +263,28 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 		AllowICMP: true,
 	}}
 
+	desc, err := svc.Describe()
+	if err != nil {
+		t.Fatalf("Describe failed: %v", err)
+	}
+	if desc.Namespace != "ns-test" || desc.Message != "plugin ready" || desc.HTTPAddr != "" {
+		t.Fatalf("unexpected initial describe response: %+v", desc)
+	}
+
 	start, err := svc.StartHTTP(18080)
 	if err != nil {
 		t.Fatalf("StartHTTP failed: %v", err)
 	}
 	if start.HTTPAddr != ":18080" {
 		t.Fatalf("unexpected http addr: %q", start.HTTPAddr)
+	}
+
+	desc, err = svc.Describe()
+	if err != nil {
+		t.Fatalf("Describe after start failed: %v", err)
+	}
+	if desc.HTTPAddr != ":18080" {
+		t.Fatalf("unexpected describe addr after start: %+v", desc)
 	}
 
 	waitForHTTP(t, func() (string, int, error) {
@@ -180,6 +337,104 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	}
 	if status.HTTPRunning {
 		t.Fatal("expected HTTPRunning=false after stop")
+	}
+}
+
+func TestStartHostDashboardAndRunHost(t *testing.T) {
+	t.Run("dashboard server", func(t *testing.T) {
+		server, addr, err := startHostDashboard("127.0.0.1:0", "eth0", "/tmp/netforge", nil)
+		if err != nil {
+			t.Fatalf("startHostDashboard failed: %v", err)
+		}
+		t.Cleanup(func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdownCtx)
+		})
+
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("ReadAll healthz failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK || string(body) != "ok\n" {
+			t.Fatalf("unexpected healthz response: code=%d body=%q", resp.StatusCode, string(body))
+		}
+
+		resp, err = http.Get("http://" + addr + "/api/namespaces")
+		if err != nil {
+			t.Fatalf("GET /api/namespaces failed: %v", err)
+		}
+		defer resp.Body.Close()
+		var payload hostDashboardData
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode api response failed: %v", err)
+		}
+		if len(payload.Namespaces) != 0 {
+			t.Fatalf("expected no namespaces, got %+v", payload.Namespaces)
+		}
+
+		resp, err = http.Get("http://" + addr + "/does-not-exist")
+		if err != nil {
+			t.Fatalf("GET /does-not-exist failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("unexpected not found status: got %d want %d", resp.StatusCode, http.StatusNotFound)
+		}
+	})
+
+	t.Run("runHost no configs", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		if err := runHost(ctx, "eth0", "/bin/true", t.TempDir(), "127.0.0.1:0", nil); err != nil {
+			t.Fatalf("runHost failed: %v", err)
+		}
+	})
+}
+
+func TestNamespaceCmdRunnerHelpers(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start failed: %v", err)
+	}
+
+	runner := &namespaceCmdRunner{
+		cmd:       cmd,
+		path:      cmd.Path,
+		namespace: "ns-helper",
+	}
+
+	if got := runner.Diagnose(context.Background()); !strings.Contains(got, `network namespace "ns-helper"`) {
+		t.Fatalf("unexpected diagnose output: %q", got)
+	}
+
+	pluginNet, pluginAddr, err := runner.PluginToHost("unix", "/tmp/plugin.sock")
+	if err != nil {
+		t.Fatalf("PluginToHost failed: %v", err)
+	}
+	if pluginNet != "unix" || pluginAddr != "/tmp/plugin.sock" {
+		t.Fatalf("unexpected PluginToHost mapping: %q %q", pluginNet, pluginAddr)
+	}
+
+	hostNet, hostAddr, err := runner.HostToPlugin("tcp", "127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("HostToPlugin failed: %v", err)
+	}
+	if hostNet != "tcp" || hostAddr != "127.0.0.1:8080" {
+		t.Fatalf("unexpected HostToPlugin mapping: %q %q", hostNet, hostAddr)
+	}
+
+	if err := runner.Kill(context.Background()); err != nil {
+		t.Fatalf("Kill failed: %v", err)
+	}
+	if _, err := cmd.Process.Wait(); err != nil {
+		t.Fatalf("wait after kill failed: %v", err)
 	}
 }
 
@@ -724,6 +979,14 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 		t.Fatalf("did not find address %s in namespace", cfg.IPCIDR)
 	}
 
+	stats, err := lookupNamespaceNICStatistics(nsName, cfg.IfName)
+	if err != nil {
+		t.Fatalf("lookupNamespaceNICStatistics failed: %v", err)
+	}
+	if stats.RxBytes > 0 && stats.RxPackets == 0 {
+		t.Fatalf("unexpected statistics relationship: %+v", stats)
+	}
+
 	routes, err := handle.RouteList(link, netlink.FAMILY_V4)
 	if err != nil {
 		t.Fatalf("RouteList failed: %v", err)
@@ -737,6 +1000,45 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 	}
 	if !foundDefault {
 		t.Fatalf("did not find default route via %s", cfg.Gateway)
+	}
+
+	neighbor1MAC, err := net.ParseMAC("02:00:00:00:10:01")
+	if err != nil {
+		t.Fatalf("ParseMAC neighbor1 failed: %v", err)
+	}
+	neighbor2MAC, err := net.ParseMAC("02:00:00:00:10:03")
+	if err != nil {
+		t.Fatalf("ParseMAC neighbor2 failed: %v", err)
+	}
+	if err := handle.NeighSet(&netlink.Neigh{
+		LinkIndex:    link.Attrs().Index,
+		IP:           net.ParseIP("10.10.100.3"),
+		HardwareAddr: neighbor2MAC,
+		State:        netlink.NUD_PERMANENT,
+	}); err != nil {
+		t.Fatalf("NeighSet neighbor2 failed: %v", err)
+	}
+	if err := handle.NeighSet(&netlink.Neigh{
+		LinkIndex:    link.Attrs().Index,
+		IP:           net.ParseIP("10.10.100.1"),
+		HardwareAddr: neighbor1MAC,
+		State:        netlink.NUD_PERMANENT,
+	}); err != nil {
+		t.Fatalf("NeighSet neighbor1 failed: %v", err)
+	}
+
+	arpEntries, err := lookupNamespaceARPTable(nsName, cfg.IfName)
+	if err != nil {
+		t.Fatalf("lookupNamespaceARPTable failed: %v", err)
+	}
+	if len(arpEntries) != 2 {
+		t.Fatalf("unexpected arp entry count: %+v", arpEntries)
+	}
+	if arpEntries[0].IP != "10.10.100.1" || arpEntries[0].MAC != "02:00:00:00:10:01" {
+		t.Fatalf("unexpected first arp entry: %+v", arpEntries[0])
+	}
+	if arpEntries[1].IP != "10.10.100.3" || arpEntries[1].MAC != "02:00:00:00:10:03" {
+		t.Fatalf("unexpected second arp entry: %+v", arpEntries[1])
 	}
 
 	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPort)
