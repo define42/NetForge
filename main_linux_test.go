@@ -207,6 +207,19 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 				return hostNICStatisticsView{}, fmt.Errorf("unexpected namespace %q", namespaceName)
 			}
 		},
+		arpLookup: func(namespaceName, ifName string) ([]hostARPEntryView, error) {
+			switch namespaceName {
+			case "ns1":
+				return []hostARPEntryView{
+					{IP: "10.10.100.1", MAC: "02:00:00:00:10:01"},
+					{IP: "10.10.100.3", MAC: "02:00:00:00:10:03"},
+				}, nil
+			case "ns2":
+				return nil, errors.New("arp unavailable")
+			default:
+				return nil, fmt.Errorf("unexpected namespace %q", namespaceName)
+			}
+		},
 		plugins: []*runningPlugin{
 			{
 				cfg: NSConfig{
@@ -269,7 +282,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 
 		body := rec.Body.String()
-		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "statistics unavailable", "plugin down"} {
+		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "10.10.100.1", "02:00:00:00:10:01", "10.10.100.3", "02:00:00:00:10:03", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "arp unavailable", "statistics unavailable", "plugin down"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("dashboard body did not contain %q: %s", want, body)
 			}
@@ -305,11 +318,20 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		if !payload.Namespaces[0].AllowICMP {
 			t.Fatalf("expected first namespace allow_icmp=true: %+v", payload.Namespaces[0])
 		}
+		if len(payload.Namespaces[0].ARPEntries) != 2 {
+			t.Fatalf("unexpected first namespace arp entries: %+v", payload.Namespaces[0].ARPEntries)
+		}
+		if payload.Namespaces[0].ARPEntries[0].IP != "10.10.100.1" || payload.Namespaces[0].ARPEntries[0].MAC != "02:00:00:00:10:01" {
+			t.Fatalf("unexpected first arp entry: %+v", payload.Namespaces[0].ARPEntries[0])
+		}
 		if payload.Namespaces[0].Statistics.RxBytes != 1024 || payload.Namespaces[0].Statistics.TxDropped != 4 {
 			t.Fatalf("unexpected first namespace statistics: %+v", payload.Namespaces[0].Statistics)
 		}
 		if payload.Namespaces[1].AllowICMP {
 			t.Fatalf("expected second namespace allow_icmp=false: %+v", payload.Namespaces[1])
+		}
+		if payload.Namespaces[1].ARPError == "" {
+			t.Fatalf("expected second namespace arp error, got %+v", payload.Namespaces[1])
 		}
 		if payload.Namespaces[1].Error == "" {
 			t.Fatalf("expected second namespace error, got %+v", payload.Namespaces[1])

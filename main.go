@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -206,6 +207,8 @@ type hostNamespaceView struct {
 	Error           string                `json:"error,omitempty"`
 	Statistics      hostNICStatisticsView `json:"statistics"`
 	StatisticsError string                `json:"statistics_error,omitempty"`
+	ARPEntries      []hostARPEntryView    `json:"arp_entries,omitempty"`
+	ARPError        string                `json:"arp_error,omitempty"`
 }
 
 type hostDashboardData struct {
@@ -226,12 +229,18 @@ type hostNICStatisticsView struct {
 	TxDropped uint64 `json:"tx_dropped"`
 }
 
+type hostARPEntryView struct {
+	IP  string `json:"ip"`
+	MAC string `json:"mac"`
+}
+
 type hostDashboardService struct {
 	addr        string
 	parentNIC   string
 	runtimeBase string
 	plugins     []*runningPlugin
 	statsLookup func(namespaceName, ifName string) (hostNICStatisticsView, error)
+	arpLookup   func(namespaceName, ifName string) ([]hostARPEntryView, error)
 }
 
 const (
@@ -321,6 +330,7 @@ code {
 <th>Plugin HTTP</th>
 <th>Open TCP</th>
 <th>ICMP</th>
+<th>ARP Table</th>
 <th>NIC Statistics</th>
 <th>Status</th>
 </tr>
@@ -336,6 +346,17 @@ code {
 <td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
 <td><code>{{if .OpenPort}}{{.OpenPort}}{{else}}none{{end}}</code></td>
 <td><code>{{if .AllowICMP}}icmp enabled{{else}}icmp disabled{{end}}</code></td>
+<td>
+{{if .ARPError}}
+<span class="status-bad">{{.ARPError}}</span>
+{{else if .ARPEntries}}
+{{range .ARPEntries}}
+<code>{{.IP}}</code><br><code>{{.MAC}}</code><br>
+{{end}}
+{{else}}
+<code>empty</code>
+{{end}}
+</td>
 <td>
 {{if .StatisticsError}}
 <span class="status-bad">{{.StatisticsError}}</span>
@@ -372,6 +393,10 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 	if statsLookup == nil {
 		statsLookup = lookupNamespaceNICStatistics
 	}
+	arpLookup := s.arpLookup
+	if arpLookup == nil {
+		arpLookup = lookupNamespaceARPTable
+	}
 
 	for _, plugin := range s.plugins {
 		view := hostNamespaceView{
@@ -391,6 +416,13 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 			view.StatisticsError = statsErr.Error()
 		} else {
 			view.Statistics = stats
+		}
+
+		arpEntries, arpErr := arpLookup(plugin.cfg.Name, plugin.cfg.IfName)
+		if arpErr != nil {
+			view.ARPError = arpErr.Error()
+		} else {
+			view.ARPEntries = arpEntries
 		}
 
 		if plugin.rpc == nil {
@@ -445,6 +477,50 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 		RuntimeBase:  s.runtimeBase,
 		Namespaces:   namespaces,
 	}
+}
+
+func lookupNamespaceARPTable(namespaceName, ifName string) ([]hostARPEntryView, error) {
+	ns, err := netns.GetFromName(namespaceName)
+	if err != nil {
+		return nil, fmt.Errorf("arp lookup namespace %q: %w", namespaceName, err)
+	}
+	defer ns.Close()
+
+	handle, err := netlink.NewHandleAt(ns)
+	if err != nil {
+		return nil, fmt.Errorf("arp open namespace %q: %w", namespaceName, err)
+	}
+	defer handle.Delete()
+
+	link, err := handle.LinkByName(ifName)
+	if err != nil {
+		return nil, fmt.Errorf("arp lookup link %q in %q: %w", ifName, namespaceName, err)
+	}
+
+	neighbors, err := handle.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
+	if err != nil {
+		return nil, fmt.Errorf("arp list neighbors on %q in %q: %w", ifName, namespaceName, err)
+	}
+
+	entries := make([]hostARPEntryView, 0, len(neighbors))
+	for _, neighbor := range neighbors {
+		if neighbor.IP == nil || neighbor.HardwareAddr == nil {
+			continue
+		}
+		entries = append(entries, hostARPEntryView{
+			IP:  neighbor.IP.String(),
+			MAC: neighbor.HardwareAddr.String(),
+		})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IP != entries[j].IP {
+			return entries[i].IP < entries[j].IP
+		}
+		return entries[i].MAC < entries[j].MAC
+	})
+
+	return entries, nil
 }
 
 func lookupNamespaceNICStatistics(namespaceName, ifName string) (hostNICStatisticsView, error) {
