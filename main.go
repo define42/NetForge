@@ -1180,15 +1180,18 @@ func (s *namespaceHTTPService) Status() (*StatusResponse, error) {
 }
 
 type runningPlugin struct {
-	cfg    NSConfig
-	client *plugin.Client
-	rpc    NamespaceService
+	cfg     NSConfig
+	client  *plugin.Client
+	rpc     NamespaceService
+	pid     int
+	sandbox pluginSandboxSpec
 }
 
 type namespaceCmdRunner struct {
 	logger    hclog.Logger
 	cmd       *exec.Cmd
 	namespace string
+	sandbox   pluginSandboxSpec
 
 	stdout io.ReadCloser
 	stderr io.ReadCloser
@@ -1196,7 +1199,61 @@ type namespaceCmdRunner struct {
 	pid    int
 }
 
-func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string) (*namespaceCmdRunner, error) {
+func stagePluginChildBinary(selfBinary, runtimeDir string) (string, error) {
+	// The child enters a new user namespace before exec, so it can lose DAC
+	// bypass on private host paths like /home/$USER. Stage a private executable
+	// copy under the runtime dir so the sandboxed child can always traverse and exec it.
+	srcInfo, err := os.Stat(selfBinary)
+	if err != nil {
+		return "", fmt.Errorf("stat plugin child binary %q: %w", selfBinary, err)
+	}
+
+	staged := filepath.Join(runtimeDir, "plugin-child")
+	if info, err := os.Stat(staged); err == nil {
+		if info.Size() == srcInfo.Size() && info.Mode().Perm()&0o111 != 0 {
+			return staged, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat staged plugin child %q: %w", staged, err)
+	}
+
+	src, err := os.Open(selfBinary)
+	if err != nil {
+		return "", fmt.Errorf("open plugin child binary %q: %w", selfBinary, err)
+	}
+	defer src.Close()
+
+	tmp := staged + ".tmp"
+	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, srcInfo.Mode().Perm()|0o111)
+	if err != nil {
+		return "", fmt.Errorf("create staged plugin child %q: %w", tmp, err)
+	}
+
+	copyErr := func() error {
+		if _, err := io.Copy(dst, src); err != nil {
+			return fmt.Errorf("copy plugin child binary to %q: %w", tmp, err)
+		}
+		if err := dst.Chmod(srcInfo.Mode().Perm() | 0o111); err != nil {
+			return fmt.Errorf("chmod staged plugin child %q: %w", tmp, err)
+		}
+		if err := dst.Close(); err != nil {
+			return fmt.Errorf("close staged plugin child %q: %w", tmp, err)
+		}
+		if err := os.Rename(tmp, staged); err != nil {
+			return fmt.Errorf("rename staged plugin child to %q: %w", staged, err)
+		}
+		return nil
+	}()
+	if copyErr != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+		return "", copyErr
+	}
+
+	return staged, nil
+}
+
+func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string, sandbox pluginSandboxSpec) (*namespaceCmdRunner, error) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -1207,18 +1264,28 @@ func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string)
 		return nil, err
 	}
 
+	if err := applyPluginSandboxSysProcAttr(cmd); err != nil {
+		return nil, err
+	}
+
+	displayPath := cmd.Path
+	if len(cmd.Args) > 0 && cmd.Args[0] != "" {
+		displayPath = cmd.Args[0]
+	}
+
 	return &namespaceCmdRunner{
 		logger:    logger,
 		cmd:       cmd,
 		namespace: namespace,
+		sandbox:   sandbox,
 		stdout:    stdout,
 		stderr:    stderr,
-		path:      cmd.Path,
+		path:      displayPath,
 	}, nil
 }
 
 func (r *namespaceCmdRunner) Start(_ context.Context) error {
-	r.logger.Debug("starting plugin", "path", r.cmd.Path, "args", r.cmd.Args, "namespace", r.namespace)
+	r.logger.Debug("starting plugin", "path", r.cmd.Path, "args", r.cmd.Args, "namespace", r.namespace, "sandbox_root", r.sandbox.rootDir)
 	if err := startCmdInNamedNamespace(r.cmd, r.namespace); err != nil {
 		return err
 	}
@@ -1265,11 +1332,11 @@ func (r *namespaceCmdRunner) Diagnose(_ context.Context) string {
 }
 
 func (r *namespaceCmdRunner) PluginToHost(pluginNet, pluginAddr string) (string, string, error) {
-	return pluginNet, pluginAddr, nil
+	return r.sandbox.pluginToHostAddr(pluginNet, pluginAddr)
 }
 
 func (r *namespaceCmdRunner) HostToPlugin(hostNet, hostAddr string) (string, string, error) {
-	return hostNet, hostAddr, nil
+	return r.sandbox.hostToPluginAddr(hostNet, hostAddr)
 }
 
 var _ runner.Runner = (*namespaceCmdRunner)(nil)
@@ -1639,22 +1706,37 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 		return nil, fmt.Errorf("create runtime dir %q: %w", runtimeDir, err)
 	}
 
+	childBinary, err := stagePluginChildBinary(selfBinary, runtimeDir)
+	if err != nil {
+		return nil, err
+	}
+
 	cfgJSON, err := pluginConfigJSON(cfg)
 	if err != nil {
 		return nil, err
 	}
 
+	var cmdRunner *namespaceCmdRunner
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig: handshake,
 		Plugins:         pluginMap,
-		RunnerFunc: func(logger hclog.Logger, cmd *exec.Cmd, _ string) (runner.Runner, error) {
-			cmd.Path = selfBinary
+		RunnerFunc: func(logger hclog.Logger, cmd *exec.Cmd, socketDir string) (runner.Runner, error) {
+			sandbox, err := newPluginSandboxSpec(runtimeDir, socketDir)
+			if err != nil {
+				return nil, err
+			}
+			cmd.Path = childBinary
 			cmd.Args = []string{selfBinary}
 			cmd.Env = append(cmd.Env,
 				"NS_PLUGIN_MODE=1",
 				"NS_PLUGIN_CONFIG="+cfgJSON,
 			)
-			return newNamespaceCmdRunner(logger, cmd, cfg.Name)
+			cmd.Env = append(cmd.Env, sandbox.env()...)
+			cmdRunner, err = newNamespaceCmdRunner(logger, cmd, cfg.Name, sandbox)
+			if err != nil {
+				return nil, err
+			}
+			return cmdRunner, nil
 		},
 		AllowedProtocols: []plugin.Protocol{
 			plugin.ProtocolNetRPC,
@@ -1691,7 +1773,12 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 		return nil, fmt.Errorf("start namespace http server in %s: %w", cfg.Name, err)
 	}
 
-	return &runningPlugin{cfg: cfg, client: client, rpc: svc}, nil
+	rp := &runningPlugin{cfg: cfg, client: client, rpc: svc}
+	if cmdRunner != nil {
+		rp.pid = cmdRunner.pid
+		rp.sandbox = cmdRunner.sandbox
+	}
+	return rp, nil
 }
 
 func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAddr string, configs []NSConfig) error {
@@ -1740,6 +1827,10 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAd
 }
 
 func runPluginMode() error {
+	if err := ensurePluginSandbox(); err != nil {
+		return err
+	}
+
 	cfg, err := loadPluginConfigFromEnv()
 	if err != nil {
 		return err
@@ -1756,6 +1847,10 @@ func runPluginMode() error {
 }
 
 func runMain() error {
+	if os.Getenv(envPluginSandboxSeccompProbe) == "1" {
+		return runPluginSandboxSeccompProbe()
+	}
+
 	if os.Getenv("NS_PLUGIN_MODE") == "1" {
 		return runPluginMode()
 	}

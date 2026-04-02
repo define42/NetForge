@@ -408,6 +408,10 @@ func TestNamespaceCmdRunnerHelpers(t *testing.T) {
 		cmd:       cmd,
 		path:      cmd.Path,
 		namespace: "ns-helper",
+		sandbox: pluginSandboxSpec{
+			hostSocketDir:   "/host/plugin-dir",
+			pluginSocketDir: pluginSandboxSocketDir,
+		},
 	}
 
 	if got := runner.Diagnose(context.Background()); !strings.Contains(got, `network namespace "ns-helper"`) {
@@ -415,10 +419,15 @@ func TestNamespaceCmdRunnerHelpers(t *testing.T) {
 	}
 
 	pluginNet, pluginAddr, err := runner.PluginToHost("unix", "/tmp/plugin.sock")
+	if err == nil {
+		t.Fatalf("expected PluginToHost to reject unmapped unix socket, got %q %q", pluginNet, pluginAddr)
+	}
+
+	pluginNet, pluginAddr, err = runner.PluginToHost("unix", "/run/go-plugin/plugin.sock")
 	if err != nil {
 		t.Fatalf("PluginToHost failed: %v", err)
 	}
-	if pluginNet != "unix" || pluginAddr != "/tmp/plugin.sock" {
+	if pluginNet != "unix" || pluginAddr != "/host/plugin-dir/plugin.sock" {
 		t.Fatalf("unexpected PluginToHost mapping: %q %q", pluginNet, pluginAddr)
 	}
 
@@ -428,6 +437,14 @@ func TestNamespaceCmdRunnerHelpers(t *testing.T) {
 	}
 	if hostNet != "tcp" || hostAddr != "127.0.0.1:8080" {
 		t.Fatalf("unexpected HostToPlugin mapping: %q %q", hostNet, hostAddr)
+	}
+
+	hostNet, hostAddr, err = runner.HostToPlugin("unix", "/host/plugin-dir/plugin.sock")
+	if err != nil {
+		t.Fatalf("HostToPlugin unix mapping failed: %v", err)
+	}
+	if hostNet != "unix" || hostAddr != "/run/go-plugin/plugin.sock" {
+		t.Fatalf("unexpected HostToPlugin unix mapping: %q %q", hostNet, hostAddr)
 	}
 
 	if err := runner.Kill(context.Background()); err != nil {
@@ -866,9 +883,9 @@ func requireIntegration(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Fatal("linux only")
 	}
-	//	if os.Geteuid() != 0 {
-	//		t.Fatal("integration tests require root privileges")
-	//	}
+	if os.Geteuid() != 0 {
+		t.Skip("integration tests require root privileges")
+	}
 }
 
 func cleanupHostLink(name string) {
@@ -896,7 +913,7 @@ func buildPackageBinary(t *testing.T) string {
 	t.Helper()
 
 	out := filepath.Join(t.TempDir(), "ns-demo-bin")
-	cmd := exec.Command("go", "build", "-o", out, ".")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", out, ".")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
@@ -906,21 +923,27 @@ func buildPackageBinary(t *testing.T) string {
 	return out
 }
 
-func httpGetInNamespace(ns netns.NsHandle, rawURL string) (string, int, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+func uniqueNamespaceToken() string {
+	return fmt.Sprintf("%02x%04x", os.Getpid()&0xff, uint64(time.Now().UnixNano())&0xffff)
+}
 
-	original, err := netns.Get()
+func freeLocalTCPPort(t *testing.T) int {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return "", 0, err
+		t.Fatalf("reserve local tcp port failed: %v", err)
 	}
-	defer original.Close()
+	defer listener.Close()
 
-	if err := netns.Set(ns); err != nil {
-		return "", 0, err
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("unexpected listener addr type: %T", listener.Addr())
 	}
-	defer netns.Set(original)
+	return addr.Port
+}
 
+func httpGetInNamespace(namespaceName, rawURL string) (string, int, error) {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", 0, err
@@ -931,20 +954,39 @@ func httpGetInNamespace(ns netns.NsHandle, rawURL string) (string, int, error) {
 		return "", 0, err
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "", 0, err
 	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	hostHeader := req.URL.Host
+	script := fmt.Sprintf(
+		"exec 3<>/dev/tcp/%s/%s; printf 'GET %s HTTP/1.1\\r\\nHost: %s\\r\\nConnection: close\\r\\n\\r\\n' >&3; cat <&3",
+		host,
+		port,
+		req.URL.RequestURI(),
+		hostHeader,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-lc", script)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := startCmdInNamedNamespace(cmd, namespaceName); err != nil {
+		return "", 0, err
+	}
+	if err := cmd.Wait(); err != nil {
+		if stderr.Len() > 0 {
+			return "", 0, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+		}
 		return "", 0, err
 	}
 
-	if err := req.Write(conn); err != nil {
-		return "", 0, err
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(stdout.Bytes())), req)
 	if err != nil {
 		return "", 0, err
 	}
@@ -1153,7 +1195,7 @@ func namespaceFirewallAllowsLoopback(ns netns.NsHandle) (bool, error) {
 func waitForHTTP(t *testing.T, fn func() (string, int, error)) {
 	t.Helper()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		_, _, err := fn()
@@ -1169,8 +1211,9 @@ func waitForHTTP(t *testing.T, fn func() (string, int, error)) {
 func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 	requireIntegration(t)
 
-	parentName := "dmy100"
-	nsName := "tns100"
+	token := uniqueNamespaceToken()
+	parentName := "d" + token
+	nsName := "tns" + token
 	cfg := NSConfig{
 		Name:       nsName,
 		VLANID:     100,
@@ -1340,8 +1383,10 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 	requireIntegration(t)
 
-	parentName := "dmy200"
-	nsName := "tns200"
+	token := uniqueNamespaceToken()
+	parentName := "d" + token
+	nsName := "tns" + token
+	listenPort := freeLocalTCPPort(t)
 	cfg := NSConfig{
 		Name:       nsName,
 		VLANID:     200,
@@ -1349,8 +1394,8 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 		IPCIDR:     "10.20.0.2/24",
 		MAC:        "02:00:00:00:20:02",
 		Gateway:    "",
-		ListenPort: 18081,
-		OpenPort:   18081,
+		ListenPort: listenPort,
+		OpenPort:   listenPort,
 	}
 
 	cleanupHostLink(cfg.IfName)
@@ -1406,11 +1451,13 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 		t.Fatal("expected HTTPRunning=true")
 	}
 
+	assertPluginSandboxed(t, proc)
+
 	waitForHTTP(t, func() (string, int, error) {
-		return httpGetInNamespace(ns, "http://127.0.0.1:18081/healthz")
+		return httpGetInNamespace(nsName, fmt.Sprintf("http://127.0.0.1:%d/healthz", cfg.ListenPort))
 	})
 
-	body, code, err := httpGetInNamespace(ns, "http://127.0.0.1:18081/")
+	body, code, err := httpGetInNamespace(nsName, fmt.Sprintf("http://127.0.0.1:%d/", cfg.ListenPort))
 	if err != nil {
 		t.Fatalf("namespace GET / failed: %v", err)
 	}
