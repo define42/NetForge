@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -99,6 +100,49 @@ type hostDashboardService struct {
 	arpLookup    func(namespaceName, ifName string) ([]hostARPEntryView, error)
 	pingFunc     func(namespaceName, targetIP string) (string, error)
 	tcpCheckFunc func(namespaceName, targetIP string, port int) (string, error)
+}
+
+var dashboardSnapshotTaskTimeout = 750 * time.Millisecond
+
+type dashboardTaskResult[T any] struct {
+	value T
+	err   error
+}
+
+func startDashboardTask[T any](ctx context.Context, name string, fn func() (T, error)) <-chan dashboardTaskResult[T] {
+	resultCh := make(chan dashboardTaskResult[T], 1)
+	timeout := dashboardSnapshotTaskTimeout
+	go func() {
+		doneCh := make(chan dashboardTaskResult[T], 1)
+		go func() {
+			value, err := fn()
+			doneCh <- dashboardTaskResult[T]{value: value, err: err}
+		}()
+
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		select {
+		case result := <-doneCh:
+			resultCh <- result
+		case <-timer.C:
+			resultCh <- dashboardTaskResult[T]{err: fmt.Errorf("%s timed out after %s", name, timeout)}
+		case <-ctx.Done():
+			resultCh <- dashboardTaskResult[T]{err: fmt.Errorf("%s canceled: %w", name, ctx.Err())}
+		}
+	}()
+	return resultCh
+}
+
+func appendDashboardError(existing *string, message string) {
+	if message == "" {
+		return
+	}
+	if *existing == "" {
+		*existing = message
+		return
+	}
+	*existing += "; " + message
 }
 
 var hostDashboardTemplate = template.Must(template.New("host-dashboard").Parse(`<!DOCTYPE html>
@@ -360,7 +404,11 @@ pre {
 </html>`))
 
 func (s *hostDashboardService) snapshot() hostDashboardData {
-	namespaces := make([]hostNamespaceView, 0, len(s.plugins))
+	return s.snapshotWithContext(context.Background())
+}
+
+func (s *hostDashboardService) snapshotWithContext(ctx context.Context) hostDashboardData {
+	namespaces := make([]hostNamespaceView, len(s.plugins))
 	statsLookup := s.statsLookup
 	if statsLookup == nil {
 		statsLookup = lookupNamespaceNICStatistics
@@ -370,78 +418,100 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 		arpLookup = lookupNamespaceARPTable
 	}
 
-	for _, plugin := range s.plugins {
-		view := hostNamespaceView{
-			Name:       plugin.cfg.Name,
-			VLANID:     plugin.cfg.VLANID,
-			Interface:  plugin.cfg.IfName,
-			IPCIDR:     plugin.cfg.IPCIDR,
-			MAC:        plugin.cfg.MAC,
-			Gateway:    plugin.cfg.Gateway,
-			ListenPort: plugin.cfg.ListenPort,
-			OpenPorts:  cloneOpenPorts(plugin.cfg.OpenPorts),
-			AllowICMP:  plugin.cfg.AllowICMP,
-		}
+	var wg sync.WaitGroup
+	for i, plugin := range s.plugins {
+		i := i
+		plugin := plugin
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-		stats, statsErr := statsLookup(plugin.cfg.Name, plugin.cfg.IfName)
-		if statsErr != nil {
-			view.StatisticsError = statsErr.Error()
-		} else {
-			view.Statistics = stats
-		}
+			view := hostNamespaceView{
+				Name:       plugin.cfg.Name,
+				VLANID:     plugin.cfg.VLANID,
+				Interface:  plugin.cfg.IfName,
+				IPCIDR:     plugin.cfg.IPCIDR,
+				MAC:        plugin.cfg.MAC,
+				Gateway:    plugin.cfg.Gateway,
+				ListenPort: plugin.cfg.ListenPort,
+				OpenPorts:  cloneOpenPorts(plugin.cfg.OpenPorts),
+				AllowICMP:  plugin.cfg.AllowICMP,
+			}
 
-		arpEntries, arpErr := arpLookup(plugin.cfg.Name, plugin.cfg.IfName)
-		if arpErr != nil {
-			view.ARPError = arpErr.Error()
-		} else {
-			view.ARPEntries = arpEntries
-		}
+			statsTask := startDashboardTask(ctx, fmt.Sprintf("statistics lookup for namespace %q", plugin.cfg.Name), func() (hostNICStatisticsView, error) {
+				return statsLookup(plugin.cfg.Name, plugin.cfg.IfName)
+			})
+			arpTask := startDashboardTask(ctx, fmt.Sprintf("arp lookup for namespace %q", plugin.cfg.Name), func() ([]hostARPEntryView, error) {
+				return arpLookup(plugin.cfg.Name, plugin.cfg.IfName)
+			})
 
-		if plugin.rpc == nil {
-			view.Error = "plugin rpc unavailable"
-			namespaces = append(namespaces, view)
-			continue
-		}
+			var describeTask <-chan dashboardTaskResult[*DescribeResponse]
+			var statusTask <-chan dashboardTaskResult[*StatusResponse]
+			if plugin.rpc == nil {
+				view.Error = "plugin rpc unavailable"
+			} else {
+				describeTask = startDashboardTask(ctx, fmt.Sprintf("describe rpc for namespace %q", plugin.cfg.Name), plugin.rpc.Describe)
+				statusTask = startDashboardTask(ctx, fmt.Sprintf("status rpc for namespace %q", plugin.cfg.Name), plugin.rpc.Status)
+			}
 
-		desc, descErr := plugin.rpc.Describe()
-		if descErr != nil {
-			view.Error = fmt.Sprintf("describe failed: %v", descErr)
-			namespaces = append(namespaces, view)
-			continue
-		}
-		view.Message = desc.Message
-		if desc.HTTPAddr != "" {
-			view.PluginHTTPAddr = desc.HTTPAddr
-		}
+			stats := <-statsTask
+			if stats.err != nil {
+				view.StatisticsError = stats.err.Error()
+			} else {
+				view.Statistics = stats.value
+			}
 
-		status, statusErr := plugin.rpc.Status()
-		if statusErr != nil {
-			view.Error = fmt.Sprintf("status failed: %v", statusErr)
-			namespaces = append(namespaces, view)
-			continue
-		}
-		if status.Interface != "" {
-			view.Interface = status.Interface
-		}
-		if status.IPCIDR != "" {
-			view.IPCIDR = status.IPCIDR
-		}
-		if status.MAC != "" {
-			view.MAC = status.MAC
-		}
-		if status.Gateway != "" {
-			view.Gateway = status.Gateway
-		}
-		if status.OpenPorts != nil {
-			view.OpenPorts = cloneOpenPorts(status.OpenPorts)
-		}
-		view.AllowICMP = status.AllowICMP
-		if status.HTTPAddr != "" {
-			view.PluginHTTPAddr = status.HTTPAddr
-		}
-		view.HTTPRunning = status.HTTPRunning
-		namespaces = append(namespaces, view)
+			arpEntries := <-arpTask
+			if arpEntries.err != nil {
+				view.ARPError = arpEntries.err.Error()
+			} else {
+				view.ARPEntries = arpEntries.value
+			}
+
+			if describeTask != nil {
+				describe := <-describeTask
+				if describe.err != nil {
+					appendDashboardError(&view.Error, fmt.Sprintf("describe failed: %v", describe.err))
+				} else {
+					view.Message = describe.value.Message
+					if describe.value.HTTPAddr != "" {
+						view.PluginHTTPAddr = describe.value.HTTPAddr
+					}
+				}
+			}
+
+			if statusTask != nil {
+				status := <-statusTask
+				if status.err != nil {
+					appendDashboardError(&view.Error, fmt.Sprintf("status failed: %v", status.err))
+				} else {
+					if status.value.Interface != "" {
+						view.Interface = status.value.Interface
+					}
+					if status.value.IPCIDR != "" {
+						view.IPCIDR = status.value.IPCIDR
+					}
+					if status.value.MAC != "" {
+						view.MAC = status.value.MAC
+					}
+					if status.value.Gateway != "" {
+						view.Gateway = status.value.Gateway
+					}
+					if status.value.OpenPorts != nil {
+						view.OpenPorts = cloneOpenPorts(status.value.OpenPorts)
+					}
+					view.AllowICMP = status.value.AllowICMP
+					if status.value.HTTPAddr != "" {
+						view.PluginHTTPAddr = status.value.HTTPAddr
+					}
+					view.HTTPRunning = status.value.HTTPRunning
+				}
+			}
+
+			namespaces[i] = view
+		}()
 	}
+	wg.Wait()
 
 	return hostDashboardData{
 		HostHTTPAddr: s.addr,
@@ -545,7 +615,7 @@ func (s *hostDashboardService) handleIndex(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
-	s.renderIndex(w, s.snapshot())
+	s.renderIndex(w, s.snapshotWithContext(r.Context()))
 }
 
 func (s *hostDashboardService) renderIndex(w http.ResponseWriter, data hostDashboardData) {
@@ -589,7 +659,7 @@ func (s *hostDashboardService) handlePing(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	data := s.snapshot()
+	data := s.snapshotWithContext(r.Context())
 	data.SelectedPingNamespace = namespaceName
 	data.PingTargetIP = targetIP
 	data.PingResult = result
@@ -637,7 +707,7 @@ func (s *hostDashboardService) handleTCPCheck(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	data := s.snapshot()
+	data := s.snapshotWithContext(r.Context())
 	data.SelectedTCPNamespace = namespaceName
 	data.TCPTargetIP = targetIP
 	data.TCPTargetPort = portRaw
@@ -650,9 +720,9 @@ func (s *hostDashboardService) handleHealthz(w http.ResponseWriter, _ *http.Requ
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-func (s *hostDashboardService) handleNamespacesAPI(w http.ResponseWriter, _ *http.Request) {
+func (s *hostDashboardService) handleNamespacesAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(s.snapshot()); err != nil {
+	if err := json.NewEncoder(w).Encode(s.snapshotWithContext(r.Context())); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }

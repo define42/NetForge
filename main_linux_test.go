@@ -78,6 +78,49 @@ func (s *stubNamespaceService) Status() (*StatusResponse, error) {
 	return s.status, nil
 }
 
+type delayedNamespaceService struct {
+	describeWait <-chan struct{}
+	describe     *DescribeResponse
+	describeErr  error
+	statusWait   <-chan struct{}
+	status       *StatusResponse
+	statusErr    error
+}
+
+func (s *delayedNamespaceService) Describe() (*DescribeResponse, error) {
+	if s.describeWait != nil {
+		<-s.describeWait
+	}
+	if s.describeErr != nil {
+		return nil, s.describeErr
+	}
+	if s.describe == nil {
+		return &DescribeResponse{}, nil
+	}
+	return s.describe, nil
+}
+
+func (s *delayedNamespaceService) StartHTTP(port int) (*StartHTTPResponse, error) {
+	return &StartHTTPResponse{HTTPAddr: fmt.Sprintf(":%d", port)}, nil
+}
+
+func (s *delayedNamespaceService) StopHTTP() error {
+	return nil
+}
+
+func (s *delayedNamespaceService) Status() (*StatusResponse, error) {
+	if s.statusWait != nil {
+		<-s.statusWait
+	}
+	if s.statusErr != nil {
+		return nil, s.statusErr
+	}
+	if s.status == nil {
+		return &StatusResponse{}, nil
+	}
+	return s.status, nil
+}
+
 func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	cfg := NSConfig{
 		Name:       "nsx",
@@ -917,6 +960,140 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+func TestHostDashboardSnapshotTimeoutsArePerTaskAndPerNamespace(t *testing.T) {
+	originalTimeout := dashboardSnapshotTaskTimeout
+	dashboardSnapshotTaskTimeout = 25 * time.Millisecond
+	defer func() {
+		dashboardSnapshotTaskTimeout = originalTimeout
+	}()
+
+	blocker := make(chan struct{})
+	defer close(blocker)
+
+	service := &hostDashboardService{
+		addr:        "127.0.0.1:8090",
+		parentNIC:   "eth0",
+		runtimeBase: "/var/lib/netforge",
+		statsLookup: func(namespaceName, ifName string) (hostNICStatisticsView, error) {
+			if namespaceName == "stuck" {
+				<-blocker
+			}
+			return hostNICStatisticsView{RxBytes: 77}, nil
+		},
+		arpLookup: func(namespaceName, ifName string) ([]hostARPEntryView, error) {
+			if namespaceName == "stuck" {
+				<-blocker
+			}
+			return []hostARPEntryView{{IP: "10.0.0.1", MAC: "02:00:00:00:00:01"}}, nil
+		},
+		plugins: []*runningPlugin{
+			{
+				cfg: NSConfig{
+					Name:       "stuck",
+					VLANID:     100,
+					IfName:     "eth0.100",
+					IPCIDR:     "10.10.0.2/24",
+					MAC:        "02:00:00:00:10:02",
+					Gateway:    "10.10.0.1",
+					ListenPort: 18080,
+					OpenPorts:  []int{18080},
+					AllowICMP:  true,
+				},
+				rpc: &delayedNamespaceService{
+					describeWait: blocker,
+					status: &StatusResponse{
+						Namespace:   "stuck",
+						Interface:   "eth0.100",
+						IPCIDR:      "10.10.0.2/24",
+						MAC:         "02:00:00:00:10:02",
+						Gateway:     "10.10.0.1",
+						OpenPorts:   []int{18080},
+						AllowICMP:   true,
+						HTTPAddr:    ":18080",
+						HTTPRunning: true,
+					},
+				},
+			},
+			{
+				cfg: NSConfig{
+					Name:       "healthy",
+					VLANID:     200,
+					IfName:     "eth0.200",
+					IPCIDR:     "10.20.0.2/24",
+					MAC:        "02:00:00:00:20:02",
+					Gateway:    "",
+					ListenPort: 18081,
+					OpenPorts:  []int{18081},
+				},
+				rpc: &stubNamespaceService{
+					describe: &DescribeResponse{
+						Namespace: "healthy",
+						HTTPAddr:  ":18081",
+						Message:   "plugin ready",
+					},
+					status: &StatusResponse{
+						Namespace:   "healthy",
+						Interface:   "eth0.200",
+						IPCIDR:      "10.20.0.2/24",
+						MAC:         "02:00:00:00:20:02",
+						OpenPorts:   []int{18081},
+						HTTPAddr:    ":18081",
+						HTTPRunning: true,
+					},
+				},
+			},
+		},
+	}
+
+	done := make(chan hostDashboardData, 1)
+	start := time.Now()
+	go func() {
+		done <- service.snapshot()
+	}()
+
+	var snapshot hostDashboardData
+	select {
+	case snapshot = <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("snapshot blocked on a bad namespace")
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("snapshot took too long: %s", elapsed)
+	}
+
+	if len(snapshot.Namespaces) != 2 {
+		t.Fatalf("unexpected namespace count: %+v", snapshot.Namespaces)
+	}
+	if snapshot.Namespaces[0].Name != "stuck" || snapshot.Namespaces[1].Name != "healthy" {
+		t.Fatalf("snapshot order changed: %+v", snapshot.Namespaces)
+	}
+
+	stuck := snapshot.Namespaces[0]
+	if !strings.Contains(stuck.StatisticsError, "timed out") {
+		t.Fatalf("expected statistics timeout, got %+v", stuck)
+	}
+	if !strings.Contains(stuck.ARPError, "timed out") {
+		t.Fatalf("expected arp timeout, got %+v", stuck)
+	}
+	if !strings.Contains(stuck.Error, "describe failed") || !strings.Contains(stuck.Error, "timed out") {
+		t.Fatalf("expected describe timeout error, got %+v", stuck)
+	}
+	if !stuck.HTTPRunning || stuck.PluginHTTPAddr != ":18080" {
+		t.Fatalf("expected status partial result for stuck namespace, got %+v", stuck)
+	}
+
+	healthy := snapshot.Namespaces[1]
+	if healthy.Error != "" || healthy.StatisticsError != "" || healthy.ARPError != "" {
+		t.Fatalf("healthy namespace should not inherit another namespace stall: %+v", healthy)
+	}
+	if healthy.Statistics.RxBytes != 77 {
+		t.Fatalf("unexpected healthy namespace statistics: %+v", healthy)
+	}
+	if healthy.PluginHTTPAddr != ":18081" || !healthy.HTTPRunning {
+		t.Fatalf("unexpected healthy namespace status: %+v", healthy)
+	}
 }
 
 func requireIntegration(t *testing.T) {
