@@ -181,17 +181,19 @@ func (s *namespaceHTTPService) Describe() (*DescribeResponse, error) {
 }
 
 type hostNamespaceView struct {
-	Name           string `json:"name"`
-	VLANID         int    `json:"vlan_id"`
-	Interface      string `json:"interface"`
-	IPCIDR         string `json:"ip_cidr"`
-	MAC            string `json:"mac"`
-	Gateway        string `json:"gateway"`
-	ListenPort     int    `json:"listen_port"`
-	PluginHTTPAddr string `json:"plugin_http_addr"`
-	HTTPRunning    bool   `json:"http_running"`
-	Message        string `json:"message"`
-	Error          string `json:"error,omitempty"`
+	Name            string                `json:"name"`
+	VLANID          int                   `json:"vlan_id"`
+	Interface       string                `json:"interface"`
+	IPCIDR          string                `json:"ip_cidr"`
+	MAC             string                `json:"mac"`
+	Gateway         string                `json:"gateway"`
+	ListenPort      int                   `json:"listen_port"`
+	PluginHTTPAddr  string                `json:"plugin_http_addr"`
+	HTTPRunning     bool                  `json:"http_running"`
+	Message         string                `json:"message"`
+	Error           string                `json:"error,omitempty"`
+	Statistics      hostNICStatisticsView `json:"statistics"`
+	StatisticsError string                `json:"statistics_error,omitempty"`
 }
 
 type hostDashboardData struct {
@@ -201,11 +203,23 @@ type hostDashboardData struct {
 	Namespaces   []hostNamespaceView `json:"namespaces"`
 }
 
+type hostNICStatisticsView struct {
+	RxBytes   uint64 `json:"rx_bytes"`
+	TxBytes   uint64 `json:"tx_bytes"`
+	RxPackets uint64 `json:"rx_packets"`
+	TxPackets uint64 `json:"tx_packets"`
+	RxErrors  uint64 `json:"rx_errors"`
+	TxErrors  uint64 `json:"tx_errors"`
+	RxDropped uint64 `json:"rx_dropped"`
+	TxDropped uint64 `json:"tx_dropped"`
+}
+
 type hostDashboardService struct {
 	addr        string
 	parentNIC   string
 	runtimeBase string
 	plugins     []*runningPlugin
+	statsLookup func(namespaceName, ifName string) (hostNICStatisticsView, error)
 }
 
 var hostDashboardTemplate = template.Must(template.New("host-dashboard").Parse(`<!DOCTYPE html>
@@ -288,6 +302,7 @@ code {
 <th>IP / Gateway</th>
 <th>MAC</th>
 <th>Plugin HTTP</th>
+<th>NIC Statistics</th>
 <th>Status</th>
 </tr>
 </thead>
@@ -300,6 +315,20 @@ code {
 <td><code>{{.IPCIDR}}</code><br><code>{{if .Gateway}}{{.Gateway}}{{else}}none{{end}}</code></td>
 <td><code>{{.MAC}}</code></td>
 <td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
+<td>
+{{if .StatisticsError}}
+<span class="status-bad">{{.StatisticsError}}</span>
+{{else}}
+<code>rx bytes {{.Statistics.RxBytes}}</code><br>
+<code>rx pkts {{.Statistics.RxPackets}}</code><br>
+<code>rx errs {{.Statistics.RxErrors}}</code><br>
+<code>rx drop {{.Statistics.RxDropped}}</code><br>
+<code>tx bytes {{.Statistics.TxBytes}}</code><br>
+<code>tx pkts {{.Statistics.TxPackets}}</code><br>
+<code>tx errs {{.Statistics.TxErrors}}</code><br>
+<code>tx drop {{.Statistics.TxDropped}}</code>
+{{end}}
+</td>
 <td>
 {{if .Error}}
 <span class="status-bad">{{.Error}}</span>
@@ -318,6 +347,11 @@ code {
 
 func (s *hostDashboardService) snapshot() hostDashboardData {
 	namespaces := make([]hostNamespaceView, 0, len(s.plugins))
+	statsLookup := s.statsLookup
+	if statsLookup == nil {
+		statsLookup = lookupNamespaceNICStatistics
+	}
+
 	for _, plugin := range s.plugins {
 		view := hostNamespaceView{
 			Name:       plugin.cfg.Name,
@@ -327,6 +361,13 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 			MAC:        plugin.cfg.MAC,
 			Gateway:    plugin.cfg.Gateway,
 			ListenPort: plugin.cfg.ListenPort,
+		}
+
+		stats, statsErr := statsLookup(plugin.cfg.Name, plugin.cfg.IfName)
+		if statsErr != nil {
+			view.StatisticsError = statsErr.Error()
+		} else {
+			view.Statistics = stats
 		}
 
 		if plugin.rpc == nil {
@@ -377,6 +418,41 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 		RuntimeBase:  s.runtimeBase,
 		Namespaces:   namespaces,
 	}
+}
+
+func lookupNamespaceNICStatistics(namespaceName, ifName string) (hostNICStatisticsView, error) {
+	ns, err := netns.GetFromName(namespaceName)
+	if err != nil {
+		return hostNICStatisticsView{}, fmt.Errorf("statistics lookup namespace %q: %w", namespaceName, err)
+	}
+	defer ns.Close()
+
+	handle, err := netlink.NewHandleAt(ns)
+	if err != nil {
+		return hostNICStatisticsView{}, fmt.Errorf("statistics open namespace %q: %w", namespaceName, err)
+	}
+	defer handle.Delete()
+
+	link, err := handle.LinkByName(ifName)
+	if err != nil {
+		return hostNICStatisticsView{}, fmt.Errorf("statistics lookup link %q in %q: %w", ifName, namespaceName, err)
+	}
+
+	stats := link.Attrs().Statistics
+	if stats == nil {
+		return hostNICStatisticsView{}, fmt.Errorf("statistics unavailable for %q in %q", ifName, namespaceName)
+	}
+
+	return hostNICStatisticsView{
+		RxBytes:   stats.RxBytes,
+		TxBytes:   stats.TxBytes,
+		RxPackets: stats.RxPackets,
+		TxPackets: stats.TxPackets,
+		RxErrors:  stats.RxErrors,
+		TxErrors:  stats.TxErrors,
+		RxDropped: stats.RxDropped,
+		TxDropped: stats.TxDropped,
+	}, nil
 }
 
 func (s *hostDashboardService) routes() http.Handler {

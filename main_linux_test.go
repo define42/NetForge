@@ -167,6 +167,25 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		addr:        "127.0.0.1:8090",
 		parentNIC:   "eth0",
 		runtimeBase: "/tmp/netforge",
+		statsLookup: func(namespaceName, ifName string) (hostNICStatisticsView, error) {
+			switch namespaceName {
+			case "ns1":
+				return hostNICStatisticsView{
+					RxBytes:   1024,
+					TxBytes:   2048,
+					RxPackets: 11,
+					TxPackets: 22,
+					RxErrors:  1,
+					TxErrors:  2,
+					RxDropped: 3,
+					TxDropped: 4,
+				}, nil
+			case "ns2":
+				return hostNICStatisticsView{}, errors.New("statistics unavailable")
+			default:
+				return hostNICStatisticsView{}, fmt.Errorf("unexpected namespace %q", namespaceName)
+			}
+		},
 		plugins: []*runningPlugin{
 			{
 				cfg: NSConfig{
@@ -223,7 +242,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 
 		body := rec.Body.String()
-		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "ns2", "plugin down"} {
+		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "rx bytes 1024", "tx drop 4", "ns2", "statistics unavailable", "plugin down"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("dashboard body did not contain %q: %s", want, body)
 			}
@@ -253,8 +272,14 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		if payload.Namespaces[0].Name != "ns1" || !payload.Namespaces[0].HTTPRunning {
 			t.Fatalf("unexpected first namespace payload: %+v", payload.Namespaces[0])
 		}
+		if payload.Namespaces[0].Statistics.RxBytes != 1024 || payload.Namespaces[0].Statistics.TxDropped != 4 {
+			t.Fatalf("unexpected first namespace statistics: %+v", payload.Namespaces[0].Statistics)
+		}
 		if payload.Namespaces[1].Error == "" {
 			t.Fatalf("expected second namespace error, got %+v", payload.Namespaces[1])
+		}
+		if payload.Namespaces[1].StatisticsError == "" {
+			t.Fatalf("expected second namespace statistics error, got %+v", payload.Namespaces[1])
 		}
 	})
 }
