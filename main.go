@@ -22,11 +22,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/nftables"
+	"github.com/google/nftables/binaryutil"
+	"github.com/google/nftables/expr"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/go-plugin/runner"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 )
 
 const pluginName = "namespace_service"
@@ -39,6 +43,7 @@ type NSConfig struct {
 	MAC        string `json:"mac"`
 	Gateway    string `json:"gateway"`
 	ListenPort int    `json:"listen_port"`
+	OpenPort   int    `json:"open_port"`
 }
 
 type PluginConfig struct {
@@ -47,6 +52,7 @@ type PluginConfig struct {
 	IPCIDR    string `json:"ip_cidr"`
 	MAC       string `json:"mac"`
 	Gateway   string `json:"gateway"`
+	OpenPort  int    `json:"open_port"`
 }
 
 type DescribeResponse struct {
@@ -65,6 +71,7 @@ type StatusResponse struct {
 	IPCIDR      string
 	MAC         string
 	Gateway     string
+	OpenPort    int
 	HTTPAddr    string
 	HTTPRunning bool
 }
@@ -188,6 +195,7 @@ type hostNamespaceView struct {
 	MAC             string                `json:"mac"`
 	Gateway         string                `json:"gateway"`
 	ListenPort      int                   `json:"listen_port"`
+	OpenPort        int                   `json:"open_port"`
 	PluginHTTPAddr  string                `json:"plugin_http_addr"`
 	HTTPRunning     bool                  `json:"http_running"`
 	Message         string                `json:"message"`
@@ -221,6 +229,11 @@ type hostDashboardService struct {
 	plugins     []*runningPlugin
 	statsLookup func(namespaceName, ifName string) (hostNICStatisticsView, error)
 }
+
+const (
+	namespaceFirewallTableName = "netforge"
+	namespaceFirewallInputName = "input"
+)
 
 var hostDashboardTemplate = template.Must(template.New("host-dashboard").Parse(`<!DOCTYPE html>
 <html lang="en">
@@ -302,6 +315,7 @@ code {
 <th>IP / Gateway</th>
 <th>MAC</th>
 <th>Plugin HTTP</th>
+<th>Open TCP</th>
 <th>NIC Statistics</th>
 <th>Status</th>
 </tr>
@@ -315,6 +329,7 @@ code {
 <td><code>{{.IPCIDR}}</code><br><code>{{if .Gateway}}{{.Gateway}}{{else}}none{{end}}</code></td>
 <td><code>{{.MAC}}</code></td>
 <td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
+<td><code>{{if .OpenPort}}{{.OpenPort}}{{else}}none{{end}}</code></td>
 <td>
 {{if .StatisticsError}}
 <span class="status-bad">{{.StatisticsError}}</span>
@@ -361,6 +376,7 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 			MAC:        plugin.cfg.MAC,
 			Gateway:    plugin.cfg.Gateway,
 			ListenPort: plugin.cfg.ListenPort,
+			OpenPort:   plugin.cfg.OpenPort,
 		}
 
 		stats, statsErr := statsLookup(plugin.cfg.Name, plugin.cfg.IfName)
@@ -404,6 +420,9 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 		}
 		if status.Gateway != "" {
 			view.Gateway = status.Gateway
+		}
+		if status.OpenPort != 0 {
+			view.OpenPort = status.OpenPort
 		}
 		if status.HTTPAddr != "" {
 			view.PluginHTTPAddr = status.HTTPAddr
@@ -453,6 +472,109 @@ func lookupNamespaceNICStatistics(namespaceName, ifName string) (hostNICStatisti
 		RxDropped: stats.RxDropped,
 		TxDropped: stats.TxDropped,
 	}, nil
+}
+
+func lookupNFTablesTable(conn *nftables.Conn, family nftables.TableFamily, name string) (*nftables.Table, error) {
+	tables, err := conn.ListTablesOfFamily(family)
+	if err != nil {
+		return nil, err
+	}
+	for _, table := range tables {
+		if table.Name == name {
+			return table, nil
+		}
+	}
+	return nil, nil
+}
+
+func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
+	cfg = normalizeNSConfig(cfg)
+
+	if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
+		return fmt.Errorf("invalid open port %d", cfg.OpenPort)
+	}
+
+	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
+	if err != nil {
+		return fmt.Errorf("open nftables connection in %s: %w", cfg.Name, err)
+	}
+
+	existing, err := lookupNFTablesTable(conn, nftables.TableFamilyINet, namespaceFirewallTableName)
+	if err != nil {
+		return fmt.Errorf("list nftables tables in %s: %w", cfg.Name, err)
+	}
+	if existing != nil {
+		conn.DelTable(existing)
+		if err := conn.Flush(); err != nil {
+			return fmt.Errorf("delete existing nftables table %q in %s: %w", namespaceFirewallTableName, cfg.Name, err)
+		}
+	}
+
+	table := conn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyINet,
+		Name:   namespaceFirewallTableName,
+	})
+	policyDrop := nftables.ChainPolicyDrop
+	input := conn.AddChain(&nftables.Chain{
+		Name:     namespaceFirewallInputName,
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookInput,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   &policyDrop,
+	})
+
+	conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: input,
+		Exprs: []expr.Any{
+			&expr.Ct{Register: 1, Key: expr.CtKeySTATE},
+			&expr.Bitwise{
+				SourceRegister: 1,
+				DestRegister:   1,
+				Len:            4,
+				Mask:           binaryutil.NativeEndian.PutUint32(expr.CtStateBitESTABLISHED | expr.CtStateBitRELATED),
+				Xor:            binaryutil.NativeEndian.PutUint32(0),
+			},
+			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0, 0, 0, 0}},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+
+	conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: input,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: nftablesInterfaceName("lo")},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+
+	if cfg.OpenPort != 0 {
+		conn.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: input,
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+				&expr.Payload{
+					DestRegister: 1,
+					Base:         expr.PayloadBaseTransportHeader,
+					Offset:       2,
+					Len:          2,
+				},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(uint16(cfg.OpenPort))},
+				&expr.Verdict{Kind: expr.VerdictAccept},
+			},
+		})
+	}
+
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("install nftables rules in %s: %w", cfg.Name, err)
+	}
+
+	return nil
 }
 
 func (s *hostDashboardService) routes() http.Handler {
@@ -597,6 +719,7 @@ func (s *namespaceHTTPService) Status() (*StatusResponse, error) {
 		IPCIDR:      s.cfg.IPCIDR,
 		MAC:         s.cfg.MAC,
 		Gateway:     s.cfg.Gateway,
+		OpenPort:    s.cfg.OpenPort,
 		HTTPAddr:    s.httpAddr,
 		HTTPRunning: s.httpServer != nil,
 	}, nil
@@ -759,6 +882,19 @@ func envDefault(key, fallback string) string {
 	return fallback
 }
 
+func normalizeNSConfig(cfg NSConfig) NSConfig {
+	if cfg.OpenPort == 0 {
+		cfg.OpenPort = cfg.ListenPort
+	}
+	return cfg
+}
+
+func nftablesInterfaceName(name string) []byte {
+	data := make([]byte, 16)
+	copy(data, []byte(name+"\x00"))
+	return data
+}
+
 func defaultConfigs(parentNIC string) []NSConfig {
 	return []NSConfig{
 		{
@@ -769,6 +905,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			MAC:        "02:00:00:00:01:01",
 			Gateway:    "192.168.1.1",
 			ListenPort: 8080,
+			OpenPort:   8080,
 		},
 		{
 			Name:       "ns2",
@@ -778,6 +915,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			MAC:        "02:00:00:00:02:02",
 			Gateway:    "192.168.2.1",
 			ListenPort: 8080,
+			OpenPort:   8080,
 		},
 	}
 }
@@ -795,16 +933,22 @@ func loadConfigs(parentNIC string) ([]NSConfig, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("NS_CONFIG_JSON did not contain any namespace configs")
 	}
+	for i := range cfgs {
+		cfgs[i] = normalizeNSConfig(cfgs[i])
+	}
 	return cfgs, nil
 }
 
 func pluginConfigJSON(cfg NSConfig) (string, error) {
+	cfg = normalizeNSConfig(cfg)
+
 	raw, err := json.Marshal(PluginConfig{
 		Namespace: cfg.Name,
 		Interface: cfg.IfName,
 		IPCIDR:    cfg.IPCIDR,
 		MAC:       cfg.MAC,
 		Gateway:   cfg.Gateway,
+		OpenPort:  cfg.OpenPort,
 	})
 	if err != nil {
 		return "", err
@@ -994,6 +1138,8 @@ func configureLinkInNamespace(ns netns.NsHandle, cfg NSConfig) error {
 }
 
 func setupNamespaceNetwork(parentNIC string, cfg NSConfig) (netns.NsHandle, error) {
+	cfg = normalizeNSConfig(cfg)
+
 	ns, err := ensureNamedNamespace(cfg.Name)
 	if err != nil {
 		return netns.None(), err
@@ -1020,11 +1166,17 @@ func setupNamespaceNetwork(parentNIC string, cfg NSConfig) (netns.NsHandle, erro
 		ns.Close()
 		return netns.None(), err
 	}
+	if err := configureNamespaceFirewall(ns, cfg); err != nil {
+		ns.Close()
+		return netns.None(), err
+	}
 
 	return ns, nil
 }
 
 func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runningPlugin, error) {
+	cfg = normalizeNSConfig(cfg)
+
 	runtimeDir := filepath.Join(runtimeBase, cfg.Name)
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create runtime dir %q: %w", runtimeDir, err)

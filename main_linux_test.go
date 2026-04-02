@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,8 +21,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/nftables"
+	"github.com/google/nftables/binaryutil"
+	"github.com/google/nftables/expr"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 )
 
 type stubNamespaceService struct {
@@ -68,6 +73,7 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 		MAC:        "02:00:00:00:42:42",
 		Gateway:    "192.0.2.1",
 		ListenPort: 8080,
+		OpenPort:   9090,
 	}
 
 	raw, err := pluginConfigJSON(cfg)
@@ -96,6 +102,9 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	if got.Gateway != cfg.Gateway {
 		t.Fatalf("gateway mismatch: got %q want %q", got.Gateway, cfg.Gateway)
 	}
+	if got.OpenPort != cfg.OpenPort {
+		t.Fatalf("open port mismatch: got %d want %d", got.OpenPort, cfg.OpenPort)
+	}
 }
 
 func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
@@ -105,6 +114,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 		IPCIDR:    "192.0.2.10/24",
 		MAC:       "02:00:00:00:10:10",
 		Gateway:   "192.0.2.1",
+		OpenPort:  18080,
 	}}
 
 	start, err := svc.StartHTTP(18080)
@@ -134,6 +144,9 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	}
 	if !status.HTTPRunning {
 		t.Fatal("expected HTTPRunning=true")
+	}
+	if status.OpenPort != 18080 {
+		t.Fatalf("unexpected open port: got %d want %d", status.OpenPort, 18080)
 	}
 
 	resp, err := http.Get("http://127.0.0.1:18080/")
@@ -196,6 +209,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 					MAC:        "02:00:00:00:10:02",
 					Gateway:    "10.10.100.1",
 					ListenPort: 18080,
+					OpenPort:   19080,
 				},
 				rpc: &stubNamespaceService{
 					describe: &DescribeResponse{
@@ -209,6 +223,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 						IPCIDR:      "10.10.100.2/24",
 						MAC:         "02:00:00:00:10:02",
 						Gateway:     "10.10.100.1",
+						OpenPort:    19080,
 						HTTPAddr:    ":18080",
 						HTTPRunning: true,
 					},
@@ -223,6 +238,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 					MAC:        "02:00:00:00:20:02",
 					Gateway:    "",
 					ListenPort: 18081,
+					OpenPort:   19081,
 				},
 				rpc: &stubNamespaceService{
 					describeErr: errors.New("plugin down"),
@@ -242,7 +258,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 
 		body := rec.Body.String()
-		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "rx bytes 1024", "tx drop 4", "ns2", "statistics unavailable", "plugin down"} {
+		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "19080", "rx bytes 1024", "tx drop 4", "ns2", "19081", "statistics unavailable", "plugin down"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("dashboard body did not contain %q: %s", want, body)
 			}
@@ -271,6 +287,9 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 		if payload.Namespaces[0].Name != "ns1" || !payload.Namespaces[0].HTTPRunning {
 			t.Fatalf("unexpected first namespace payload: %+v", payload.Namespaces[0])
+		}
+		if payload.Namespaces[0].OpenPort != 19080 {
+			t.Fatalf("unexpected first namespace open port: %+v", payload.Namespaces[0])
 		}
 		if payload.Namespaces[0].Statistics.RxBytes != 1024 || payload.Namespaces[0].Statistics.TxDropped != 4 {
 			t.Fatalf("unexpected first namespace statistics: %+v", payload.Namespaces[0].Statistics)
@@ -413,6 +432,65 @@ func routeIsDefaultV4(route netlink.Route) bool {
 	return bits == 32 && ones == 0
 }
 
+func nftRuleAcceptsTCPPort(rule *nftables.Rule, port int) bool {
+	wantPort := binaryutil.BigEndian.PutUint16(uint16(port))
+	sawTCP := false
+	sawPort := false
+	sawAccept := false
+
+	for _, expression := range rule.Exprs {
+		switch exprValue := expression.(type) {
+		case *expr.Cmp:
+			if bytes.Equal(exprValue.Data, []byte{unix.IPPROTO_TCP}) {
+				sawTCP = true
+			}
+			if bytes.Equal(exprValue.Data, wantPort) {
+				sawPort = true
+			}
+		case *expr.Verdict:
+			if exprValue.Kind == expr.VerdictAccept {
+				sawAccept = true
+			}
+		}
+	}
+
+	return sawTCP && sawPort && sawAccept
+}
+
+func namespaceFirewallAllowsTCPPort(ns netns.NsHandle, port int) (bool, error) {
+	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
+	if err != nil {
+		return false, err
+	}
+
+	table, err := lookupNFTablesTable(conn, nftables.TableFamilyINet, namespaceFirewallTableName)
+	if err != nil {
+		return false, err
+	}
+	if table == nil {
+		return false, nil
+	}
+
+	chain, err := conn.ListChain(table, namespaceFirewallInputName)
+	if err != nil {
+		return false, err
+	}
+	if chain.Policy == nil || *chain.Policy != nftables.ChainPolicyDrop {
+		return false, fmt.Errorf("unexpected chain policy: %+v", chain.Policy)
+	}
+
+	rules, err := conn.GetRules(table, chain)
+	if err != nil {
+		return false, err
+	}
+	for _, rule := range rules {
+		if nftRuleAcceptsTCPPort(rule, port) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func waitForHTTP(t *testing.T, fn func() (string, int, error)) {
 	t.Helper()
 
@@ -442,6 +520,7 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 		MAC:        "02:00:00:00:10:02",
 		Gateway:    "10.10.100.1",
 		ListenPort: 18080,
+		OpenPort:   19080,
 	}
 
 	cleanupHostLink(cfg.IfName)
@@ -517,6 +596,14 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 	if !foundDefault {
 		t.Fatalf("did not find default route via %s", cfg.Gateway)
 	}
+
+	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPort)
+	if err != nil {
+		t.Fatalf("namespace firewall lookup failed: %v", err)
+	}
+	if !allowsPort {
+		t.Fatalf("namespace firewall did not allow tcp port %d", cfg.OpenPort)
+	}
 }
 
 func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
@@ -532,6 +619,7 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 		MAC:        "02:00:00:00:20:02",
 		Gateway:    "",
 		ListenPort: 18081,
+		OpenPort:   18081,
 	}
 
 	cleanupHostLink(cfg.IfName)
