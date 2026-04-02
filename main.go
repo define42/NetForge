@@ -277,6 +277,15 @@ const (
 	namespaceFirewallInputName = "input"
 )
 
+var (
+	namedNetnsDir         = "/run/netns"
+	hostLinkByName        = netlink.LinkByName
+	readDirEntries        = os.ReadDir
+	removeAllPath         = os.RemoveAll
+	destroyNamespaceLinks = destroyNamespaceLinksInNetns
+	deleteNamedNamespace  = netns.DeleteNamed
+)
+
 var hostDashboardTemplate = template.Must(template.New("host-dashboard").Parse(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1529,6 +1538,213 @@ func loadPluginConfigFromEnv() (PluginConfig, error) {
 	return cfg, nil
 }
 
+func validateHostConfig(parentNIC string, configs []NSConfig) error {
+	if _, err := hostLinkByName(parentNIC); err != nil {
+		return fmt.Errorf("lookup parent link %q: %w", parentNIC, err)
+	}
+
+	seenNamespaces := make(map[string]struct{}, len(configs))
+	seenInterfaces := make(map[string]struct{}, len(configs))
+	for _, rawCfg := range configs {
+		cfg := normalizeNSConfig(rawCfg)
+
+		if cfg.Name == "" {
+			return errors.New("namespace name must not be empty")
+		}
+		if cfg.IfName == "" {
+			return fmt.Errorf("interface name must not be empty for namespace %q", cfg.Name)
+		}
+		if _, ok := seenNamespaces[cfg.Name]; ok {
+			return fmt.Errorf("duplicate namespace name %q", cfg.Name)
+		}
+		seenNamespaces[cfg.Name] = struct{}{}
+		if _, ok := seenInterfaces[cfg.IfName]; ok {
+			return fmt.Errorf("duplicate interface name %q", cfg.IfName)
+		}
+		seenInterfaces[cfg.IfName] = struct{}{}
+
+		if _, err := netlink.ParseAddr(cfg.IPCIDR); err != nil {
+			return fmt.Errorf("parse ip %q for namespace %q: %w", cfg.IPCIDR, cfg.Name, err)
+		}
+		if cfg.MAC != "" {
+			if _, err := net.ParseMAC(cfg.MAC); err != nil {
+				return fmt.Errorf("parse mac %q for namespace %q: %w", cfg.MAC, cfg.Name, err)
+			}
+		}
+		if cfg.Gateway != "" && net.ParseIP(cfg.Gateway) == nil {
+			return fmt.Errorf("invalid gateway %q for namespace %q", cfg.Gateway, cfg.Name)
+		}
+		if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
+			return fmt.Errorf("invalid open port %d for namespace %q", cfg.OpenPort, cfg.Name)
+		}
+	}
+
+	return nil
+}
+
+func listNamedNamespaces() ([]string, error) {
+	entries, err := readDirEntries(namedNetnsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read named namespaces from %q: %w", namedNetnsDir, err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func listRuntimeNamespaces(runtimeBase string) ([]string, error) {
+	entries, err := readDirEntries(runtimeBase)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read runtime base %q: %w", runtimeBase, err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func destroyNamespaceLinksInNetns(name string) error {
+	ns, err := netns.GetFromName(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("lookup namespace %q: %w", name, err)
+	}
+	defer ns.Close()
+
+	handle, err := netlink.NewHandleAt(ns)
+	if err != nil {
+		return fmt.Errorf("open netlink handle in %q: %w", name, err)
+	}
+	defer handle.Delete()
+
+	links, err := handle.LinkList()
+	if err != nil {
+		return fmt.Errorf("list links in %q: %w", name, err)
+	}
+	for _, link := range links {
+		if link.Attrs() == nil || link.Attrs().Name == "lo" {
+			continue
+		}
+		if err := handle.LinkDel(link); err != nil {
+			return fmt.Errorf("delete link %q in %q: %w", link.Attrs().Name, name, err)
+		}
+	}
+
+	return nil
+}
+
+func destroyNamespaceState(name, runtimeBase string) error {
+	if name == "" {
+		return nil
+	}
+
+	if err := destroyNamespaceLinks(name); err != nil {
+		return err
+	}
+	if err := deleteNamedNamespace(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete namespace %q: %w", name, err)
+	}
+	if runtimeBase == "" {
+		return nil
+	}
+	if err := removeAllPath(filepath.Join(runtimeBase, name)); err != nil {
+		return fmt.Errorf("remove runtime dir for %q: %w", name, err)
+	}
+	return nil
+}
+
+func cleanupNamespaceSet(runtimeBase string, names []string) {
+	for _, name := range uniqueSortedStrings(names) {
+		if err := destroyNamespaceState(name, runtimeBase); err != nil {
+			log.Printf("cleanup namespace=%s failed: %v", name, err)
+		}
+	}
+}
+
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func reconcileNamespaces(parentNIC, runtimeBase string, configs []NSConfig) ([]string, error) {
+	if err := validateHostConfig(parentNIC, configs); err != nil {
+		return nil, err
+	}
+
+	namespaces, err := listNamedNamespaces()
+	if err != nil {
+		return nil, err
+	}
+	runtimeNamespaces, err := listRuntimeNamespaces(runtimeBase)
+	if err != nil {
+		return nil, err
+	}
+
+	cleanupNames := make([]string, 0, len(namespaces)+len(runtimeNamespaces)+len(configs))
+	cleanupNames = append(cleanupNames, namespaces...)
+	cleanupNames = append(cleanupNames, runtimeNamespaces...)
+	for _, cfg := range configs {
+		cleanupNames = append(cleanupNames, cfg.Name)
+	}
+	cleanupNames = uniqueSortedStrings(cleanupNames)
+
+	for _, name := range cleanupNames {
+		if err := destroyNamespaceState(name, runtimeBase); err != nil {
+			return nil, err
+		}
+	}
+
+	recreated := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		ns, err := setupNamespaceNetwork(parentNIC, cfg)
+		if err != nil {
+			cleanupNamespaceSet(runtimeBase, append(recreated, cfg.Name))
+			return nil, err
+		}
+		_ = ns.Close()
+		recreated = append(recreated, cfg.Name)
+	}
+
+	return recreated, nil
+}
+
 func ensureNamedNamespace(name string) (netns.NsHandle, error) {
 	if ns, err := netns.GetFromName(name); err == nil {
 		return ns, nil
@@ -1662,6 +1878,19 @@ func configureLinkInNamespace(ns netns.NsHandle, cfg NSConfig) error {
 	if err != nil {
 		return fmt.Errorf("parse ip %q: %w", cfg.IPCIDR, err)
 	}
+	addrs, err := handle.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("list addresses on %q: %w", cfg.IfName, err)
+	}
+	for _, existing := range addrs {
+		if existing.Equal(*addr) {
+			continue
+		}
+		stale := existing
+		if err := handle.AddrDel(link, &stale); err != nil {
+			return fmt.Errorf("delete stale address %s on %q: %w", stale.String(), cfg.IfName, err)
+		}
+	}
 	if err := handle.AddrReplace(link, addr); err != nil {
 		return fmt.Errorf("set address %s on %q: %w", cfg.IPCIDR, cfg.IfName, err)
 	}
@@ -1670,25 +1899,24 @@ func configureLinkInNamespace(ns netns.NsHandle, cfg NSConfig) error {
 		return fmt.Errorf("bring %q up: %w", cfg.IfName, err)
 	}
 
+	routes, err := handle.RouteList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("list routes on %q: %w", cfg.IfName, err)
+	}
+	for _, route := range routes {
+		if route.Dst != nil {
+			continue
+		}
+		stale := route
+		if err := handle.RouteDel(&stale); err != nil {
+			return fmt.Errorf("delete stale default route on %q: %w", cfg.IfName, err)
+		}
+	}
 	if cfg.Gateway != "" {
 		gateway := net.ParseIP(cfg.Gateway)
 		if gateway == nil {
 			return fmt.Errorf("invalid gateway %q", cfg.Gateway)
 		}
-
-		routes, err := handle.RouteList(link, netlink.FAMILY_V4)
-		if err != nil {
-			return fmt.Errorf("list routes on %q: %w", cfg.IfName, err)
-		}
-		for _, route := range routes {
-			if route.Dst == nil && route.Gw != nil && !route.Gw.Equal(gateway) {
-				stale := route
-				if err := handle.RouteDel(&stale); err != nil {
-					return fmt.Errorf("delete stale default route via %s on %q: %w", stale.Gw, cfg.IfName, err)
-				}
-			}
-		}
-
 		if err := handle.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: gateway}); err != nil {
 			return fmt.Errorf("set default route via %s on %q: %w", gateway, cfg.IfName, err)
 		}
@@ -1705,21 +1933,13 @@ func setupNamespaceNetwork(parentNIC string, cfg NSConfig) (netns.NsHandle, erro
 		return netns.None(), err
 	}
 
-	exists, err := namespaceHasLink(ns, cfg.IfName)
-	if err != nil {
+	if err := ensureVLANInHost(parentNIC, cfg.IfName, cfg.VLANID); err != nil {
 		ns.Close()
 		return netns.None(), err
 	}
-
-	if !exists {
-		if err := ensureVLANInHost(parentNIC, cfg.IfName, cfg.VLANID); err != nil {
-			ns.Close()
-			return netns.None(), err
-		}
-		if err := moveLinkToNamespace(cfg.IfName, ns); err != nil {
-			ns.Close()
-			return netns.None(), err
-		}
+	if err := moveLinkToNamespace(cfg.IfName, ns); err != nil {
+		ns.Close()
+		return netns.None(), err
 	}
 
 	if err := configureLinkInNamespace(ns, cfg); err != nil {
@@ -1830,21 +2050,31 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 	return rp, nil
 }
 
-func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAddr string, configs []NSConfig) error {
+func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAddr string, configs []NSConfig) (err error) {
+	for i := range configs {
+		configs[i] = normalizeNSConfig(configs[i])
+	}
+	if err := validateHostConfig(parentNIC, configs); err != nil {
+		return err
+	}
+
+	recreatedNamespaces, err := reconcileNamespaces(parentNIC, runtimeBase, configs)
+	if err != nil {
+		return err
+	}
+
 	plugins := make([]*runningPlugin, 0, len(configs))
+	cleanupNamespacesOnExit := true
 	defer func() {
 		for _, p := range plugins {
 			p.Stop()
 		}
+		if cleanupNamespacesOnExit {
+			cleanupNamespaceSet(runtimeBase, recreatedNamespaces)
+		}
 	}()
 
 	for _, cfg := range configs {
-		ns, err := setupNamespaceNetwork(parentNIC, cfg)
-		if err != nil {
-			return err
-		}
-		_ = ns.Close()
-
 		rp, err := startNamespacePlugin(selfBinary, runtimeBase, cfg)
 		if err != nil {
 			return err
@@ -1867,6 +2097,7 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAd
 		return fmt.Errorf("start host dashboard on %s: %w", hostHTTPAddr, err)
 	}
 	log.Printf("host dashboard listening on http://%s", actualAddr)
+	cleanupNamespacesOnExit = false
 
 	<-ctx.Done()
 

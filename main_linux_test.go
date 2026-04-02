@@ -389,6 +389,21 @@ func TestStartHostDashboardAndRunHost(t *testing.T) {
 	})
 
 	t.Run("runHost no configs", func(t *testing.T) {
+		restore := restoreReconcileTestHooks()
+		defer restore()
+
+		hostLinkByName = func(name string) (netlink.Link, error) {
+			link := &netlink.Dummy{LinkAttrs: netlink.NewLinkAttrs()}
+			link.LinkAttrs.Name = name
+			return link, nil
+		}
+		readDirEntries = func(string) ([]os.DirEntry, error) {
+			return nil, os.ErrNotExist
+		}
+		destroyNamespaceLinks = func(string) error { return nil }
+		deleteNamedNamespace = func(string) error { return nil }
+		removeAllPath = func(string) error { return nil }
+
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
