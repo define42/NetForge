@@ -279,12 +279,27 @@ func runPluginMode() {
 }
 
 type namespaceRunner struct {
-	cmd    *exec.Cmd
-	stdout io.ReadCloser
-	stderr io.ReadCloser
+	cmd         *exec.Cmd
+	stdout      io.ReadCloser
+	stderr      io.ReadCloser
+	stdoutWrite *os.File
+	stderrWrite *os.File
 }
 
-func (r *namespaceRunner) Start(context.Context) error { return r.cmd.Start() }
+func (r *namespaceRunner) Start(ctx context.Context) error {
+	if err := r.cmd.Start(); err != nil {
+		return err
+	}
+	// Close the write ends in the parent so that readers on the read ends
+	// (stdout/stderr) see EOF once the child process exits.
+	if err := r.stdoutWrite.Close(); err != nil {
+		return err
+	}
+	if err := r.stderrWrite.Close(); err != nil {
+		return err
+	}
+	return nil
+}
 func (r *namespaceRunner) Wait(context.Context) error  { return r.cmd.Wait() }
 func (r *namespaceRunner) Name() string                { return filepath.Base(r.cmd.Path) }
 func (r *namespaceRunner) Stdout() io.ReadCloser      { return r.stdout }
@@ -331,9 +346,11 @@ func newNamespaceRunner(nsName string, cmdSpec *exec.Cmd) (runner.Runner, error)
 	cmd.Stderr = stderrClient
 
 	return &namespaceRunner{
-		cmd:    cmd,
-		stdout: stdoutServer,
-		stderr: stderrServer,
+		cmd:         cmd,
+		stdout:      stdoutServer,
+		stderr:      stderrServer,
+		stdoutWrite: stdoutClient,
+		stderrWrite: stderrClient,
 	}, nil
 }
 
@@ -588,8 +605,10 @@ func startPlugin(selfBin string, runtimeBase string, cfg NSConfig) (*pluginProc,
 		RunnerFunc: func(_ hclog.Logger, cmd *exec.Cmd, _ string) (runner.Runner, error) {
 			cmd.Path = selfBin
 			cmd.Args = []string{selfBin}
+			// Preserve cmd.Env set by go-plugin (contains the magic cookie) and
+			// append our own variables on top.
 			cmd.Env = append(
-				os.Environ(),
+				cmd.Env,
 				"NS_PLUGIN_MODE=1",
 				"NS_PLUGIN_CONFIG="+pluginConfigJSON(cfg),
 			)
