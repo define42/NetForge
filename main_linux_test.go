@@ -3,8 +3,11 @@
 package main
 
 import (
+	"bufio"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,14 +127,11 @@ func requireIntegration(t *testing.T) {
 	t.Helper()
 
 	if runtime.GOOS != "linux" {
-		t.Skip("linux only")
+		t.Fatal("linux only")
 	}
-	if os.Getenv("INTEGRATION") != "1" {
-		t.Skip("set INTEGRATION=1 to run integration tests")
-	}
-	if os.Geteuid() != 0 {
-		t.Skip("integration tests require root")
-	}
+	//	if os.Geteuid() != 0 {
+	//		t.Fatal("integration tests require root privileges")
+	//	}
 }
 
 func cleanupHostLink(name string) {
@@ -169,7 +169,7 @@ func buildPackageBinary(t *testing.T) string {
 	return out
 }
 
-func httpGetInNamespace(ns netns.NsHandle, url string) (string, int, error) {
+func httpGetInNamespace(ns netns.NsHandle, rawURL string) (string, int, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -184,8 +184,30 @@ func httpGetInNamespace(ns netns.NsHandle, url string) (string, int, error) {
 	}
 	defer netns.Set(original)
 
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+
+	addr, err := namespaceHTTPAddress(req.URL)
+	if err != nil {
+		return "", 0, err
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return "", 0, err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return "", 0, err
+	}
+
+	if err := req.Write(conn); err != nil {
+		return "", 0, err
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
 		return "", 0, err
 	}
@@ -196,6 +218,38 @@ func httpGetInNamespace(ns netns.NsHandle, url string) (string, int, error) {
 		return "", 0, err
 	}
 	return string(body), resp.StatusCode, nil
+}
+
+func namespaceHTTPAddress(u *url.URL) (string, error) {
+	if u == nil {
+		return "", os.ErrInvalid
+	}
+	if u.Host == "" {
+		return "", &url.Error{Op: "parse", URL: u.String(), Err: os.ErrInvalid}
+	}
+	if _, _, err := net.SplitHostPort(u.Host); err == nil {
+		return u.Host, nil
+	}
+
+	switch u.Scheme {
+	case "http":
+		return net.JoinHostPort(u.Host, "80"), nil
+	case "https":
+		return net.JoinHostPort(u.Host, "443"), nil
+	default:
+		return "", &url.Error{Op: "parse", URL: u.String(), Err: os.ErrInvalid}
+	}
+}
+
+func routeIsDefaultV4(route netlink.Route) bool {
+	if route.Dst == nil {
+		return true
+	}
+	if route.Dst.IP == nil || route.Dst.IP.To4() == nil {
+		return false
+	}
+	ones, bits := route.Dst.Mask.Size()
+	return bits == 32 && ones == 0
 }
 
 func waitForHTTP(t *testing.T, fn func() (string, int, error)) {
@@ -294,7 +348,7 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 	}
 	foundDefault := false
 	for _, route := range routes {
-		if route.Dst == nil && route.Gw != nil && route.Gw.String() == cfg.Gateway {
+		if routeIsDefaultV4(route) && route.Gw != nil && route.Gw.String() == cfg.Gateway {
 			foundDefault = true
 			break
 		}

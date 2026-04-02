@@ -684,7 +684,7 @@ func runMain() error {
 	}
 
 	parentNIC := envDefault("PARENT_NIC", "eth0")
-	runtimeBase := envDefault("PLUGIN_RUNTIME_BASE", "/run/ns-go-plugin-demo")
+	runtimeBase := envDefault("PLUGIN_RUNTIME_BASE", "./netforge")
 
 	configs, err := loadConfigs(parentNIC)
 	if err != nil {
