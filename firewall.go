@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	namespaceFirewallTableName = "netforge"
-	namespaceFirewallInputName = "input"
+	namespaceFirewallTableName   = "netforge"
+	namespaceFirewallInputName   = "input"
+	namespaceFirewallForwardName = "forward"
 )
 
 func lookupNFTablesTable(conn *nftables.Conn, family nftables.TableFamily, name string) (*nftables.Table, error) {
@@ -48,6 +49,7 @@ type namespaceFirewallConn interface {
 type namespaceFirewallState struct {
 	table        *nftables.Table
 	inputChain   *nftables.Chain
+	forwardChain *nftables.Chain
 	replaceTable bool
 }
 
@@ -87,17 +89,29 @@ func namespaceFirewallInputChainSpec(table *nftables.Table) *nftables.Chain {
 	}
 }
 
+func namespaceFirewallForwardChainSpec(table *nftables.Table) *nftables.Chain {
+	policyDrop := nftables.ChainPolicyDrop
+	return &nftables.Chain{
+		Name:     namespaceFirewallForwardName,
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   &policyDrop,
+	}
+}
+
 func nftablesInterfaceName(name string) []byte {
 	data := make([]byte, 16)
 	copy(data, []byte(name+"\x00"))
 	return data
 }
 
-func isNamespaceFirewallInputChain(chain *nftables.Chain) bool {
-	if chain == nil || chain.Name != namespaceFirewallInputName || chain.Type != nftables.ChainTypeFilter || chain.Device != "" {
+func isNamespaceFirewallBaseChain(chain *nftables.Chain, name string, hook *nftables.ChainHook) bool {
+	if chain == nil || chain.Name != name || chain.Type != nftables.ChainTypeFilter || chain.Device != "" {
 		return false
 	}
-	if chain.Hooknum == nil || *chain.Hooknum != *nftables.ChainHookInput {
+	if chain.Hooknum == nil || *chain.Hooknum != *hook {
 		return false
 	}
 	if chain.Priority == nil || *chain.Priority != *nftables.ChainPriorityFilter {
@@ -107,6 +121,14 @@ func isNamespaceFirewallInputChain(chain *nftables.Chain) bool {
 		return false
 	}
 	return true
+}
+
+func isNamespaceFirewallInputChain(chain *nftables.Chain) bool {
+	return isNamespaceFirewallBaseChain(chain, namespaceFirewallInputName, nftables.ChainHookInput)
+}
+
+func isNamespaceFirewallForwardChain(chain *nftables.Chain) bool {
+	return isNamespaceFirewallBaseChain(chain, namespaceFirewallForwardName, nftables.ChainHookForward)
 }
 
 func discoverNamespaceFirewallState(conn namespaceFirewallConn) (namespaceFirewallState, error) {
@@ -134,14 +156,26 @@ func discoverNamespaceFirewallState(conn namespaceFirewallConn) (namespaceFirewa
 		}
 	}
 
-	if len(tableChains) != 1 {
-		return namespaceFirewallState{table: table, replaceTable: true}, nil
-	}
-	if !isNamespaceFirewallInputChain(tableChains[0]) {
+	if len(tableChains) != 2 {
 		return namespaceFirewallState{table: table, replaceTable: true}, nil
 	}
 
-	return namespaceFirewallState{table: table, inputChain: tableChains[0]}, nil
+	state := namespaceFirewallState{table: table}
+	for _, chain := range tableChains {
+		switch {
+		case isNamespaceFirewallInputChain(chain):
+			state.inputChain = chain
+		case isNamespaceFirewallForwardChain(chain):
+			state.forwardChain = chain
+		default:
+			return namespaceFirewallState{table: table, replaceTable: true}, nil
+		}
+	}
+	if state.inputChain == nil || state.forwardChain == nil {
+		return namespaceFirewallState{table: table, replaceTable: true}, nil
+	}
+
+	return state, nil
 }
 
 func queueNamespaceFirewallRules(conn namespaceFirewallConn, table *nftables.Table, input *nftables.Chain, cfg NSConfig) {
@@ -214,14 +248,17 @@ func configureNamespaceFirewallWithConn(conn namespaceFirewallConn, cfg NSConfig
 	case state.table == nil:
 		table := conn.AddTable(namespaceFirewallTableSpec())
 		input := conn.AddChain(namespaceFirewallInputChainSpec(table))
+		conn.AddChain(namespaceFirewallForwardChainSpec(table))
 		queueNamespaceFirewallRules(conn, table, input, cfg)
 	case state.replaceTable:
 		conn.DelTable(state.table)
 		table := conn.AddTable(namespaceFirewallTableSpec())
 		input := conn.AddChain(namespaceFirewallInputChainSpec(table))
+		conn.AddChain(namespaceFirewallForwardChainSpec(table))
 		queueNamespaceFirewallRules(conn, table, input, cfg)
 	default:
 		conn.FlushChain(state.inputChain)
+		conn.FlushChain(state.forwardChain)
 		queueNamespaceFirewallRules(conn, state.table, state.inputChain, cfg)
 	}
 

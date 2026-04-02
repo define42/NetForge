@@ -1745,6 +1745,11 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 	if allowsLoopback {
 		t.Fatal("namespace firewall unexpectedly bypassed loopback traffic")
 	}
+
+	firewallState := firewallStateForNamespace(t, ns)
+	if firewallState.forwardChain == nil || firewallState.forwardChain.Policy == nil || *firewallState.forwardChain.Policy != nftables.ChainPolicyDrop {
+		t.Fatalf("namespace firewall forward chain was not drop-policy: %+v", firewallState.forwardChain)
+	}
 }
 
 func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {

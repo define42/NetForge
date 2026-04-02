@@ -120,6 +120,7 @@ func TestConfigureNamespaceFirewallWithConnMissingTable(t *testing.T) {
 	wantOps := []string{
 		"add-table:" + namespaceFirewallTableName,
 		"add-chain:" + namespaceFirewallInputName,
+		"add-chain:" + namespaceFirewallForwardName,
 		"add-rule",
 		"add-rule",
 		"add-rule",
@@ -137,10 +138,11 @@ func TestConfigureNamespaceFirewallWithConnMissingTable(t *testing.T) {
 
 func TestConfigureNamespaceFirewallWithConnExistingTable(t *testing.T) {
 	table := namespaceFirewallTableSpec()
-	chain := namespaceFirewallInputChainSpec(table)
+	input := namespaceFirewallInputChainSpec(table)
+	forward := namespaceFirewallForwardChainSpec(table)
 	conn := &fakeNamespaceFirewallConn{
 		tables: []*nftables.Table{table},
-		chains: []*nftables.Chain{chain},
+		chains: []*nftables.Chain{input, forward},
 	}
 
 	if err := configureNamespaceFirewallWithConn(conn, NSConfig{Name: "ns1"}); err != nil {
@@ -149,6 +151,7 @@ func TestConfigureNamespaceFirewallWithConnExistingTable(t *testing.T) {
 
 	wantOps := []string{
 		"flush-chain:" + namespaceFirewallInputName,
+		"flush-chain:" + namespaceFirewallForwardName,
 		"add-rule",
 		"flush",
 	}
@@ -162,13 +165,14 @@ func TestConfigureNamespaceFirewallWithConnExistingTable(t *testing.T) {
 
 func TestConfigureNamespaceFirewallWithConnStructuralDrift(t *testing.T) {
 	table := namespaceFirewallTableSpec()
-	chain := namespaceFirewallInputChainSpec(table)
+	input := namespaceFirewallInputChainSpec(table)
+	forward := namespaceFirewallForwardChainSpec(table)
 	policyAccept := nftables.ChainPolicyAccept
-	chain.Policy = &policyAccept
+	input.Policy = &policyAccept
 
 	conn := &fakeNamespaceFirewallConn{
 		tables: []*nftables.Table{table},
-		chains: []*nftables.Chain{chain},
+		chains: []*nftables.Chain{input, forward},
 	}
 
 	if err := configureNamespaceFirewallWithConn(conn, NSConfig{Name: "ns1"}); err != nil {
@@ -179,6 +183,7 @@ func TestConfigureNamespaceFirewallWithConnStructuralDrift(t *testing.T) {
 		"del-table:" + namespaceFirewallTableName,
 		"add-table:" + namespaceFirewallTableName,
 		"add-chain:" + namespaceFirewallInputName,
+		"add-chain:" + namespaceFirewallForwardName,
 		"add-rule",
 		"flush",
 	}
@@ -219,11 +224,14 @@ func TestConfigureNamespaceFirewallReconfigureIntegration(t *testing.T) {
 	}
 
 	state := firewallStateForNamespace(t, ns)
-	if state.table == nil || state.inputChain == nil || state.replaceTable {
+	if state.table == nil || state.inputChain == nil || state.forwardChain == nil || state.replaceTable {
 		t.Fatalf("unexpected firewall state after reconfigure: %+v", state)
 	}
 	if state.inputChain.Policy == nil || *state.inputChain.Policy != nftables.ChainPolicyDrop {
 		t.Fatalf("unexpected chain policy after reconfigure: %+v", state.inputChain.Policy)
+	}
+	if state.forwardChain.Policy == nil || *state.forwardChain.Policy != nftables.ChainPolicyDrop {
+		t.Fatalf("unexpected forward chain policy after reconfigure: %+v", state.forwardChain.Policy)
 	}
 
 	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPorts[0])
@@ -295,11 +303,14 @@ func TestConfigureNamespaceFirewallFlushFailurePreservesFirewall(t *testing.T) {
 	}
 
 	state := firewallStateForNamespace(t, ns)
-	if state.table == nil || state.inputChain == nil || state.replaceTable {
+	if state.table == nil || state.inputChain == nil || state.forwardChain == nil || state.replaceTable {
 		t.Fatalf("unexpected firewall state after failed update: %+v", state)
 	}
 	if state.inputChain.Policy == nil || *state.inputChain.Policy != nftables.ChainPolicyDrop {
 		t.Fatalf("unexpected chain policy after failed update: %+v", state.inputChain.Policy)
+	}
+	if state.forwardChain.Policy == nil || *state.forwardChain.Policy != nftables.ChainPolicyDrop {
+		t.Fatalf("unexpected forward chain policy after failed update: %+v", state.forwardChain.Policy)
 	}
 
 	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPorts[0])
