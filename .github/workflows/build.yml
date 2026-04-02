@@ -27,6 +27,4 @@ jobs:
         run: go build -v ./...
 
       - name: Test
-        env:
-          INTEGRATION: "1"
-        run: sudo -E go test -v ./...
+        run: make test
