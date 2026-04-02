@@ -38,6 +38,15 @@ type stubNamespaceService struct {
 	startErr       error
 	checkTCPOutput string
 	checkTCPErr    error
+	sftpListHook   func(SFTPListRequest) (*SFTPListResponse, error)
+	sftpList       *SFTPListResponse
+	sftpListErr    error
+	sftpFetch      *SFTPFetchResponse
+	sftpFetchErr   error
+	sftpPush       *SFTPPushResponse
+	sftpPushErr    error
+	sftpDelete     *SFTPDeleteResponse
+	sftpDeleteErr  error
 	stopErr        error
 	status         *StatusResponse
 	statusErr      error
@@ -71,6 +80,49 @@ func (s *stubNamespaceService) CheckTCPPort(targetIP string, port int) (string, 
 		return s.checkTCPOutput, nil
 	}
 	return fmt.Sprintf("tcp connect to %s succeeded", net.JoinHostPort(targetIP, fmt.Sprintf("%d", port))), nil
+}
+
+func (s *stubNamespaceService) SFTPList(req SFTPListRequest) (*SFTPListResponse, error) {
+	if s.sftpListHook != nil {
+		return s.sftpListHook(req)
+	}
+	if s.sftpListErr != nil {
+		return nil, s.sftpListErr
+	}
+	if s.sftpList != nil {
+		return s.sftpList, nil
+	}
+	return &SFTPListResponse{}, nil
+}
+
+func (s *stubNamespaceService) SFTPFetch(req SFTPFetchRequest) (*SFTPFetchResponse, error) {
+	if s.sftpFetchErr != nil {
+		return nil, s.sftpFetchErr
+	}
+	if s.sftpFetch != nil {
+		return s.sftpFetch, nil
+	}
+	return &SFTPFetchResponse{Path: req.Path}, nil
+}
+
+func (s *stubNamespaceService) SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error) {
+	if s.sftpPushErr != nil {
+		return nil, s.sftpPushErr
+	}
+	if s.sftpPush != nil {
+		return s.sftpPush, nil
+	}
+	return &SFTPPushResponse{Path: req.Path, BytesWritten: int64(len(req.Data))}, nil
+}
+
+func (s *stubNamespaceService) SFTPDelete(req SFTPDeleteRequest) (*SFTPDeleteResponse, error) {
+	if s.sftpDeleteErr != nil {
+		return nil, s.sftpDeleteErr
+	}
+	if s.sftpDelete != nil {
+		return s.sftpDelete, nil
+	}
+	return &SFTPDeleteResponse{Path: req.Path, Removed: true}, nil
 }
 
 func (s *stubNamespaceService) StopHTTP() error {
@@ -118,6 +170,22 @@ func (s *delayedNamespaceService) StartHTTP(port int) (*StartHTTPResponse, error
 
 func (s *delayedNamespaceService) CheckTCPPort(targetIP string, port int) (string, error) {
 	return fmt.Sprintf("tcp connect to %s succeeded", net.JoinHostPort(targetIP, fmt.Sprintf("%d", port))), nil
+}
+
+func (s *delayedNamespaceService) SFTPList(req SFTPListRequest) (*SFTPListResponse, error) {
+	return &SFTPListResponse{}, nil
+}
+
+func (s *delayedNamespaceService) SFTPFetch(req SFTPFetchRequest) (*SFTPFetchResponse, error) {
+	return &SFTPFetchResponse{Path: req.Path}, nil
+}
+
+func (s *delayedNamespaceService) SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error) {
+	return &SFTPPushResponse{Path: req.Path, BytesWritten: int64(len(req.Data))}, nil
+}
+
+func (s *delayedNamespaceService) SFTPDelete(req SFTPDeleteRequest) (*SFTPDeleteResponse, error) {
+	return &SFTPDeleteResponse{Path: req.Path, Removed: true}, nil
 }
 
 func (s *delayedNamespaceService) StopHTTP() error {
@@ -347,6 +415,26 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 		},
 		start:          &StartHTTPResponse{HTTPAddr: ":19090"},
 		checkTCPOutput: "tcp connect to 192.0.2.10:19090 from ns-rpc succeeded",
+		sftpList: &SFTPListResponse{
+			Entries: []SFTPEntry{
+				{Name: "demo.txt", Path: "/demo.txt", Size: 4, Mode: 0o100644, IsDir: false, ModTimeUnix: 1234},
+			},
+		},
+		sftpFetch: &SFTPFetchResponse{
+			Path:        "/demo.txt",
+			Data:        []byte("demo"),
+			Size:        4,
+			Mode:        0o100644,
+			ModTimeUnix: 1234,
+		},
+		sftpPush: &SFTPPushResponse{
+			Path:         "/upload/demo.txt",
+			BytesWritten: 5,
+		},
+		sftpDelete: &SFTPDeleteResponse{
+			Path:    "/upload/demo.txt",
+			Removed: true,
+		},
 		status: &StatusResponse{
 			Namespace:   "ns-rpc",
 			Interface:   "eth0.42",
@@ -392,6 +480,38 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 	}
 	if checkTCP != "tcp connect to 192.0.2.10:19090 from ns-rpc succeeded" {
 		t.Fatalf("unexpected CheckTCPPort response: %q", checkTCP)
+	}
+
+	var list SFTPListResponse
+	if err := server.SFTPList(SFTPListRequest{Directory: "/"}, &list); err != nil {
+		t.Fatalf("SFTPList failed: %v", err)
+	}
+	if len(list.Entries) != 1 || list.Entries[0].Path != "/demo.txt" {
+		t.Fatalf("unexpected SFTPList response: %+v", list)
+	}
+
+	var fetch SFTPFetchResponse
+	if err := server.SFTPFetch(SFTPFetchRequest{Path: "/demo.txt"}, &fetch); err != nil {
+		t.Fatalf("SFTPFetch failed: %v", err)
+	}
+	if fetch.Path != "/demo.txt" || string(fetch.Data) != "demo" {
+		t.Fatalf("unexpected SFTPFetch response: %+v", fetch)
+	}
+
+	var push SFTPPushResponse
+	if err := server.SFTPPush(SFTPPushRequest{Path: "/upload/demo.txt", Data: []byte("hello")}, &push); err != nil {
+		t.Fatalf("SFTPPush failed: %v", err)
+	}
+	if push.Path != "/upload/demo.txt" || push.BytesWritten != 5 {
+		t.Fatalf("unexpected SFTPPush response: %+v", push)
+	}
+
+	var del SFTPDeleteResponse
+	if err := server.SFTPDelete(SFTPDeleteRequest{Path: "/upload/demo.txt"}, &del); err != nil {
+		t.Fatalf("SFTPDelete failed: %v", err)
+	}
+	if del.Path != "/upload/demo.txt" || !del.Removed {
+		t.Fatalf("unexpected SFTPDelete response: %+v", del)
 	}
 
 	if err := server.StopHTTP(struct{}{}, &struct{}{}); err != nil {
@@ -755,9 +875,48 @@ func TestHostDashboardServiceCheckTCPPortUsesPluginRPC(t *testing.T) {
 	}
 }
 
+func TestHostDashboardServiceListSFTPUsesPluginRPC(t *testing.T) {
+	var gotReq SFTPListRequest
+	service := &hostDashboardService{
+		plugins: []*runningPlugin{
+			{
+				cfg: NSConfig{Name: "ns1"},
+				rpc: &stubNamespaceService{
+					sftpListHook: func(req SFTPListRequest) (*SFTPListResponse, error) {
+						gotReq = req
+						return &SFTPListResponse{
+							Entries: []SFTPEntry{{Name: "demo.txt", Path: "/demo.txt", Size: 4}},
+						}, nil
+					},
+				},
+			},
+		},
+	}
+
+	resp, err := service.listSFTP("ns1", SFTPListRequest{
+		Connection: SFTPConnectionInfo{
+			Address:               "10.10.100.1:22",
+			Username:              "demo",
+			Password:              "secret",
+			InsecureIgnoreHostKey: true,
+		},
+		Directory: "/incoming",
+	})
+	if err != nil {
+		t.Fatalf("listSFTP failed: %v", err)
+	}
+	if len(resp.Entries) != 1 || resp.Entries[0].Path != "/demo.txt" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if gotReq.Connection.Address != "10.10.100.1:22" || gotReq.Connection.Username != "demo" || gotReq.Connection.Password != "secret" || !gotReq.Connection.InsecureIgnoreHostKey || gotReq.Directory != "/incoming" {
+		t.Fatalf("unexpected forwarded request: %+v", gotReq)
+	}
+}
+
 func TestHostDashboardServiceRoutes(t *testing.T) {
 	var pingCalls []string
 	var tcpCheckCalls []string
+	var sftpListCalls []SFTPListRequest
 	service := &hostDashboardService{
 		addr:        "127.0.0.1:8090",
 		parentNIC:   "eth0",
@@ -827,6 +986,15 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 						HTTPAddr:  ":18080",
 						Message:   "plugin ready",
 					},
+					sftpListHook: func(req SFTPListRequest) (*SFTPListResponse, error) {
+						sftpListCalls = append(sftpListCalls, req)
+						return &SFTPListResponse{
+							Entries: []SFTPEntry{
+								{Name: "alpha.txt", Path: "/incoming/alpha.txt", Size: 5, Mode: 0o640},
+								{Name: "logs", Path: "/incoming/logs", IsDir: true, Mode: 0o755},
+							},
+						}, nil
+					},
 					status: &StatusResponse{
 						Namespace:   "ns1",
 						Interface:   "eth0.100",
@@ -854,6 +1022,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 				},
 				rpc: &stubNamespaceService{
 					describeErr: errors.New("plugin down"),
+					sftpListErr: errors.New("sftp unavailable"),
 				},
 			},
 		},
@@ -870,7 +1039,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 
 		body := rec.Body.String()
-		for _, want := range []string{"NetForge Dashboard", "Ping From Namespace", "Test TCP Port", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "10.10.100.1", "02:00:00:00:10:01", "10.10.100.3", "02:00:00:00:10:03", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "arp unavailable", "statistics unavailable", "plugin down"} {
+		for _, want := range []string{"NetForge Dashboard", "Ping From Namespace", "Test TCP Port", "SFTP File List", "List SFTP Files", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "10.10.100.1", "02:00:00:00:10:01", "10.10.100.3", "02:00:00:00:10:03", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "arp unavailable", "statistics unavailable", "plugin down"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("dashboard body did not contain %q: %s", want, body)
 			}
@@ -1152,6 +1321,112 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 
 	t.Run("tcp wrong method", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/tcp-check", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusMethodNotAllowed)
+		}
+	})
+
+	t.Run("sftp success", func(t *testing.T) {
+		sftpListCalls = nil
+
+		form := url.Values{
+			"namespace":   {"ns1"},
+			"server_host": {"10.10.100.1"},
+			"port":        {"22"},
+			"username":    {"deploy"},
+			"password":    {"secret-pass"},
+			"directory":   {"/incoming"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/sftp-list", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(sftpListCalls) != 1 {
+			t.Fatalf("unexpected sftp list calls: %+v", sftpListCalls)
+		}
+		if got := sftpListCalls[0]; got.Connection.Address != "10.10.100.1:22" || got.Connection.Username != "deploy" || got.Connection.Password != "secret-pass" || !got.Connection.InsecureIgnoreHostKey || got.Directory != "/incoming" {
+			t.Fatalf("unexpected sftp request: %+v", got)
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{"SFTP list succeeded", "ns1", "10.10.100.1:22", "deploy", "/incoming/alpha.txt", "/incoming/logs", "Directory:</strong> <code>/incoming</code>"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("sftp success body did not contain %q: %s", want, body)
+			}
+		}
+		if strings.Contains(body, "secret-pass") {
+			t.Fatalf("sftp success body leaked password: %s", body)
+		}
+	})
+
+	t.Run("sftp missing user name", func(t *testing.T) {
+		sftpListCalls = nil
+
+		form := url.Values{
+			"namespace":   {"ns1"},
+			"server_host": {"10.10.100.1"},
+			"port":        {"22"},
+			"username":    {""},
+			"password":    {"secret-pass"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/sftp-list", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(sftpListCalls) != 0 {
+			t.Fatalf("expected no sftp list calls for missing user name, got %+v", sftpListCalls)
+		}
+		if !strings.Contains(rec.Body.String(), "user name is required") {
+			t.Fatalf("expected missing user name error, got %s", rec.Body.String())
+		}
+	})
+
+	t.Run("sftp failure", func(t *testing.T) {
+		sftpListCalls = nil
+
+		form := url.Values{
+			"namespace":   {"ns2"},
+			"server_host": {"10.20.0.1"},
+			"port":        {"22"},
+			"username":    {"deploy"},
+			"password":    {"secret-pass"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/sftp-list", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(sftpListCalls) != 0 {
+			t.Fatalf("unexpected sftp list calls for ns2: %+v", sftpListCalls)
+		}
+		body := rec.Body.String()
+		for _, want := range []string{"SFTP list failed", "ns2", "10.20.0.1:22", "sftp unavailable"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("sftp failure body did not contain %q: %s", want, body)
+			}
+		}
+	})
+
+	t.Run("sftp wrong method", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/sftp-list", nil)
 		rec := httptest.NewRecorder()
 
 		service.routes().ServeHTTP(rec, req)

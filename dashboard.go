@@ -55,6 +55,12 @@ type hostDashboardData struct {
 	TCPTargetIP           string              `json:"tcp_target_ip,omitempty"`
 	TCPTargetPort         string              `json:"tcp_target_port,omitempty"`
 	TCPCheckResult        *hostTCPResultView  `json:"tcp_check_result,omitempty"`
+	SelectedSFTPNamespace string              `json:"selected_sftp_namespace,omitempty"`
+	SFTPServerHost        string              `json:"sftp_server_host,omitempty"`
+	SFTPServerPort        string              `json:"sftp_server_port,omitempty"`
+	SFTPUsername          string              `json:"sftp_username,omitempty"`
+	SFTPDirectory         string              `json:"sftp_directory,omitempty"`
+	SFTPListResult        *hostSFTPResultView `json:"sftp_list_result,omitempty"`
 }
 
 type hostNICStatisticsView struct {
@@ -88,6 +94,17 @@ type hostTCPResultView struct {
 	Success   bool   `json:"success"`
 	Output    string `json:"output,omitempty"`
 	Error     string `json:"error,omitempty"`
+}
+
+type hostSFTPResultView struct {
+	Namespace string      `json:"namespace"`
+	Server    string      `json:"server"`
+	Port      int         `json:"port"`
+	Username  string      `json:"username"`
+	Directory string      `json:"directory"`
+	Success   bool        `json:"success"`
+	Entries   []SFTPEntry `json:"entries,omitempty"`
+	Error     string      `json:"error,omitempty"`
 }
 
 type hostDashboardService struct {
@@ -422,6 +439,71 @@ pre {
 </div>
 {{end}}
 </div>
+<div class="probe-pane">
+<h2>SFTP File List</h2>
+<form class="ping-form" method="post" action="/sftp-list">
+<label>Namespace
+<select name="namespace" required>
+<option value="">Select namespace</option>
+{{range .Namespaces}}
+<option value="{{.Name}}" {{if eq $.SelectedSFTPNamespace .Name}}selected{{end}}>{{.Name}}</option>
+{{end}}
+</select>
+</label>
+<label>Server IP / Host
+<input type="text" name="server_host" placeholder="192.168.1.10" value="{{.SFTPServerHost}}" required>
+</label>
+<label>TCP Port
+<input type="number" name="port" min="1" max="65535" placeholder="22" value="{{.SFTPServerPort}}" required>
+</label>
+<label>User Name
+<input type="text" name="username" placeholder="deploy" value="{{.SFTPUsername}}" required>
+</label>
+<label>Password
+<input type="password" name="password" placeholder="password" required>
+</label>
+<label>Directory
+<input type="text" name="directory" placeholder="." value="{{.SFTPDirectory}}">
+</label>
+<div>
+<button type="submit">List SFTP Files</button>
+</div>
+</form>
+{{if .SFTPListResult}}
+<div style="margin-top: 1rem;">
+{{if .SFTPListResult.Success}}
+<div class="status-ok">SFTP list succeeded: <code>{{.SFTPListResult.Namespace}}</code> -> <code>{{.SFTPListResult.Server}}:{{.SFTPListResult.Port}}</code> as <code>{{.SFTPListResult.Username}}</code></div>
+{{else}}
+<div class="status-bad">SFTP list failed: <code>{{.SFTPListResult.Namespace}}</code> -> <code>{{.SFTPListResult.Server}}:{{.SFTPListResult.Port}}</code>{{if .SFTPListResult.Error}}<br>{{.SFTPListResult.Error}}{{end}}</div>
+{{end}}
+<div style="margin-top: 0.5rem;"><strong>Directory:</strong> <code>{{if .SFTPListResult.Directory}}{{.SFTPListResult.Directory}}{{else}}.{{end}}</code></div>
+{{if .SFTPListResult.Entries}}
+<table style="margin-top: 0.85rem;">
+<thead>
+<tr>
+<th>Path</th>
+<th>Type</th>
+<th>Size</th>
+<th>Mode</th>
+</tr>
+</thead>
+<tbody>
+{{range .SFTPListResult.Entries}}
+<tr>
+<td><code>{{.Path}}</code></td>
+<td><code>{{if .IsDir}}dir{{else}}file{{end}}</code></td>
+<td><code>{{.Size}}</code></td>
+<td><code>{{printf "%#o" .Mode}}</code></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else if .SFTPListResult.Success}}
+<pre>empty directory</pre>
+{{end}}
+</div>
+{{end}}
+</div>
 </div>
 </div>
 <table>
@@ -694,6 +776,7 @@ func (s *hostDashboardService) routes() http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/tcp-check", s.handleTCPCheck)
+	mux.HandleFunc("/sftp-list", s.handleSFTPList)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/namespaces", s.handleNamespacesAPI)
 	return mux
@@ -804,6 +887,74 @@ func (s *hostDashboardService) handleTCPCheck(w http.ResponseWriter, r *http.Req
 	s.renderIndex(w, data)
 }
 
+func (s *hostDashboardService) handleSFTPList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	namespaceName := strings.TrimSpace(r.FormValue("namespace"))
+	serverHost := strings.Trim(strings.TrimSpace(r.FormValue("server_host")), "[]")
+	portRaw := strings.TrimSpace(r.FormValue("port"))
+	username := strings.TrimSpace(r.FormValue("username"))
+	password := r.FormValue("password")
+	directory := strings.TrimSpace(r.FormValue("directory"))
+	result := &hostSFTPResultView{
+		Namespace: namespaceName,
+		Server:    serverHost,
+		Username:  username,
+		Directory: directory,
+	}
+
+	switch {
+	case namespaceName == "":
+		result.Error = "namespace is required"
+	case !s.hasNamespace(namespaceName):
+		result.Error = fmt.Sprintf("unknown namespace %q", namespaceName)
+	case serverHost == "":
+		result.Error = "server host is required"
+	case username == "":
+		result.Error = "user name is required"
+	case password == "":
+		result.Error = "password is required"
+	default:
+		port, err := strconv.Atoi(portRaw)
+		if err != nil || port < 1 || port > 65535 {
+			result.Error = fmt.Sprintf("invalid TCP port %q", portRaw)
+		} else {
+			result.Port = port
+			entries, err := s.listSFTP(namespaceName, SFTPListRequest{
+				Connection: SFTPConnectionInfo{
+					Address:               net.JoinHostPort(serverHost, strconv.Itoa(port)),
+					Username:              username,
+					Password:              password,
+					InsecureIgnoreHostKey: true,
+				},
+				Directory: directory,
+			})
+			if err != nil {
+				result.Error = err.Error()
+			} else {
+				result.Success = true
+				result.Entries = entries.Entries
+			}
+		}
+	}
+
+	data := s.snapshotWithContext(r.Context())
+	data.SelectedSFTPNamespace = namespaceName
+	data.SFTPServerHost = serverHost
+	data.SFTPServerPort = portRaw
+	data.SFTPUsername = username
+	data.SFTPDirectory = directory
+	data.SFTPListResult = result
+	s.renderIndex(w, data)
+}
+
 func (s *hostDashboardService) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
@@ -849,6 +1000,17 @@ func (s *hostDashboardService) checkTCPPort(namespaceName, targetIP string, port
 		return "", fmt.Errorf("plugin rpc for namespace %q is unavailable", namespaceName)
 	}
 	return plugin.rpc.CheckTCPPort(targetIP, port)
+}
+
+func (s *hostDashboardService) listSFTP(namespaceName string, req SFTPListRequest) (*SFTPListResponse, error) {
+	plugin := s.pluginForNamespace(namespaceName)
+	if plugin == nil {
+		return nil, fmt.Errorf("unknown namespace %q", namespaceName)
+	}
+	if plugin.rpc == nil {
+		return nil, fmt.Errorf("plugin rpc for namespace %q is unavailable", namespaceName)
+	}
+	return plugin.rpc.SFTPList(req)
 }
 
 func withNamedNamespace(namespaceName string, fn func() error) error {
