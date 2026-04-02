@@ -17,9 +17,115 @@ import (
 	"github.com/vishvananda/netns"
 )
 
-func requireRootIntegration(t *testing.T) {
+func TestPluginConfigJSONRoundTrip(t *testing.T) {
+	cfg := NSConfig{
+		Name:       "nsx",
+		VLANID:     42,
+		IfName:     "eth0.42",
+		IPCIDR:     "192.0.2.10/24",
+		MAC:        "02:00:00:00:42:42",
+		Gateway:    "192.0.2.1",
+		ListenPort: 8080,
+	}
+
+	raw, err := pluginConfigJSON(cfg)
+	if err != nil {
+		t.Fatalf("pluginConfigJSON failed: %v", err)
+	}
+
+	t.Setenv("NS_PLUGIN_CONFIG", raw)
+	got, err := loadPluginConfigFromEnv()
+	if err != nil {
+		t.Fatalf("loadPluginConfigFromEnv failed: %v", err)
+	}
+
+	if got.Namespace != cfg.Name {
+		t.Fatalf("namespace mismatch: got %q want %q", got.Namespace, cfg.Name)
+	}
+	if got.Interface != cfg.IfName {
+		t.Fatalf("interface mismatch: got %q want %q", got.Interface, cfg.IfName)
+	}
+	if got.IPCIDR != cfg.IPCIDR {
+		t.Fatalf("ip mismatch: got %q want %q", got.IPCIDR, cfg.IPCIDR)
+	}
+	if got.MAC != cfg.MAC {
+		t.Fatalf("mac mismatch: got %q want %q", got.MAC, cfg.MAC)
+	}
+	if got.Gateway != cfg.Gateway {
+		t.Fatalf("gateway mismatch: got %q want %q", got.Gateway, cfg.Gateway)
+	}
+}
+
+func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
+	svc := &namespaceHTTPService{cfg: PluginConfig{
+		Namespace: "ns-test",
+		Interface: "eth0.100",
+		IPCIDR:    "192.0.2.10/24",
+		MAC:       "02:00:00:00:10:10",
+		Gateway:   "192.0.2.1",
+	}}
+
+	start, err := svc.StartHTTP(18080)
+	if err != nil {
+		t.Fatalf("StartHTTP failed: %v", err)
+	}
+	if start.HTTPAddr != ":18080" {
+		t.Fatalf("unexpected http addr: %q", start.HTTPAddr)
+	}
+
+	waitForHTTP(t, func() (string, int, error) {
+		resp, err := http.Get("http://127.0.0.1:18080/")
+		if err != nil {
+			return "", 0, err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", 0, err
+		}
+		return string(body), resp.StatusCode, nil
+	})
+
+	status, err := svc.Status()
+	if err != nil {
+		t.Fatalf("Status failed: %v", err)
+	}
+	if !status.HTTPRunning {
+		t.Fatal("expected HTTPRunning=true")
+	}
+
+	resp, err := http.Get("http://127.0.0.1:18080/")
+	if err != nil {
+		t.Fatalf("GET / failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if !strings.Contains(string(body), "namespace=ns-test") {
+		t.Fatalf("unexpected body: %s", string(body))
+	}
+
+	if err := svc.StopHTTP(); err != nil {
+		t.Fatalf("StopHTTP failed: %v", err)
+	}
+
+	status, err = svc.Status()
+	if err != nil {
+		t.Fatalf("Status after stop failed: %v", err)
+	}
+	if status.HTTPRunning {
+		t.Fatal("expected HTTPRunning=false after stop")
+	}
+}
+
+func requireIntegration(t *testing.T) {
 	t.Helper()
 
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
 	if os.Getenv("INTEGRATION") != "1" {
 		t.Skip("set INTEGRATION=1 to run integration tests")
 	}
@@ -28,28 +134,38 @@ func requireRootIntegration(t *testing.T) {
 	}
 }
 
-func cleanupLink(t *testing.T, name string) {
-	t.Helper()
-	if link, err := netlink.LinkByName(name); err == nil {
+func cleanupHostLink(name string) {
+	link, err := netlink.LinkByName(name)
+	if err == nil {
 		_ = netlink.LinkDel(link)
 	}
 }
 
-func buildTestBinary(t *testing.T) string {
+func deleteLinkInNamespace(ns netns.NsHandle, linkName string) error {
+	handle, err := netlink.NewHandleAt(ns)
+	if err != nil {
+		return err
+	}
+	defer handle.Delete()
+
+	link, err := handle.LinkByName(linkName)
+	if err != nil {
+		return nil
+	}
+	return handle.LinkDel(link)
+}
+
+func buildPackageBinary(t *testing.T) string {
 	t.Helper()
 
-	tmpDir := t.TempDir()
-	out := filepath.Join(tmpDir, "ns-demo-testbin")
-
+	out := filepath.Join(t.TempDir(), "ns-demo-bin")
 	cmd := exec.Command("go", "build", "-o", out, ".")
-	cmd.Env = os.Environ()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
+	cmd.Env = os.Environ()
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("failed to build test binary: %v", err)
+		t.Fatalf("go build failed: %v", err)
 	}
-
 	return out
 }
 
@@ -57,20 +173,18 @@ func httpGetInNamespace(ns netns.NsHandle, url string) (string, int, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	orig, err := netns.Get()
+	original, err := netns.Get()
 	if err != nil {
 		return "", 0, err
 	}
-	defer orig.Close()
+	defer original.Close()
 
 	if err := netns.Set(ns); err != nil {
 		return "", 0, err
 	}
-	defer netns.Set(orig)
+	defer netns.Set(original)
 
-	client := &http.Client{
-		Timeout: 3 * time.Second,
-	}
+	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		return "", 0, err
@@ -81,164 +195,195 @@ func httpGetInNamespace(ns netns.NsHandle, url string) (string, int, error) {
 	if err != nil {
 		return "", 0, err
 	}
-
 	return string(body), resp.StatusCode, nil
 }
 
-func TestNamespaceVLANSetup(t *testing.T) {
-	requireRootIntegration(t)
+func waitForHTTP(t *testing.T, fn func() (string, int, error)) {
+	t.Helper()
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		_, _, err := fn()
+		if err == nil {
+			return
+		}
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("http server did not become ready: %v", lastErr)
+}
 
-	parentName := "dummytest0"
-	nsName := "testns100"
-	vlanIf := "dummytest0.100"
+func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
+	requireIntegration(t)
 
-	cleanupLink(t, vlanIf)
-	cleanupLink(t, parentName)
+	parentName := "dmy100"
+	nsName := "tns100"
+	cfg := NSConfig{
+		Name:       nsName,
+		VLANID:     100,
+		IfName:     parentName + ".100",
+		IPCIDR:     "10.10.100.2/24",
+		MAC:        "02:00:00:00:10:02",
+		Gateway:    "10.10.100.1",
+		ListenPort: 18080,
+	}
+
+	cleanupHostLink(cfg.IfName)
+	cleanupHostLink(parentName)
 	_ = netns.DeleteNamed(nsName)
 
-	parent := &netlink.Dummy{
-		LinkAttrs: netlink.LinkAttrs{Name: parentName},
+	dummy := &netlink.Dummy{LinkAttrs: netlink.NewLinkAttrs()}
+	dummy.LinkAttrs.Name = parentName
+	if err := netlink.LinkAdd(dummy); err != nil {
+		t.Fatalf("create dummy parent failed: %v", err)
 	}
-	if err := netlink.LinkAdd(parent); err != nil {
-		t.Fatalf("failed to create dummy parent: %v", err)
+	parent, err := netlink.LinkByName(parentName)
+	if err != nil {
+		t.Fatalf("lookup dummy parent failed: %v", err)
 	}
+	if err := netlink.LinkSetUp(parent); err != nil {
+		t.Fatalf("bring dummy parent up failed: %v", err)
+	}
+
+	ns, err := setupNamespaceNetwork(parentName, cfg)
+	if err != nil {
+		t.Fatalf("setupNamespaceNetwork failed: %v", err)
+	}
+
 	t.Cleanup(func() {
-		cleanupLink(t, vlanIf)
-		cleanupLink(t, parentName)
+		_ = deleteLinkInNamespace(ns, cfg.IfName)
+		_ = ns.Close()
 		_ = netns.DeleteNamed(nsName)
+		cleanupHostLink(parentName)
+		cleanupHostLink(cfg.IfName)
 	})
 
-	parentLink, err := netlink.LinkByName(parentName)
+	handle, err := netlink.NewHandleAt(ns)
 	if err != nil {
-		t.Fatalf("failed to lookup parent link: %v", err)
+		t.Fatalf("NewHandleAt failed: %v", err)
 	}
-	if err := netlink.LinkSetUp(parentLink); err != nil {
-		t.Fatalf("failed to bring parent up: %v", err)
-	}
+	defer handle.Delete()
 
-	ns := ensureNamespace(nsName)
-	defer ns.Close()
-
-	ensureVLANInHost(parentName, vlanIf, 100)
-	moveLinkToNamespaceIfNeeded(vlanIf, ns)
-	configureLinkInNamespace(ns, vlanIf, "10.10.100.2/24", "02:00:00:00:10:02", "")
-
-	ok, err := withNamespace(ns, func() (bool, error) {
-		link, err := netlink.LinkByName(vlanIf)
-		if err != nil {
-			return false, err
-		}
-
-		if got := link.Attrs().HardwareAddr.String(); got != "02:00:00:00:10:02" {
-			t.Fatalf("unexpected MAC: got %s", got)
-		}
-
-		addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-		if err != nil {
-			return false, err
-		}
-
-		for _, a := range addrs {
-			if a.IPNet != nil && a.IPNet.String() == "10.10.100.2/24" {
-				return true, nil
-			}
-		}
-		return false, nil
-	})
+	link, err := handle.LinkByName(cfg.IfName)
 	if err != nil {
-		t.Fatalf("verification inside namespace failed: %v", err)
+		t.Fatalf("lookup link in namespace failed: %v", err)
 	}
-	if !ok {
-		t.Fatal("expected VLAN interface with 10.10.100.2/24 inside namespace")
+	if got := link.Attrs().HardwareAddr.String(); got != cfg.MAC {
+		t.Fatalf("mac mismatch: got %s want %s", got, cfg.MAC)
+	}
+
+	addrs, err := handle.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		t.Fatalf("AddrList failed: %v", err)
+	}
+	foundAddr := false
+	for _, addr := range addrs {
+		if addr.IPNet != nil && addr.IPNet.String() == cfg.IPCIDR {
+			foundAddr = true
+			break
+		}
+	}
+	if !foundAddr {
+		t.Fatalf("did not find address %s in namespace", cfg.IPCIDR)
+	}
+
+	routes, err := handle.RouteList(link, netlink.FAMILY_V4)
+	if err != nil {
+		t.Fatalf("RouteList failed: %v", err)
+	}
+	foundDefault := false
+	for _, route := range routes {
+		if route.Dst == nil && route.Gw != nil && route.Gw.String() == cfg.Gateway {
+			foundDefault = true
+			break
+		}
+	}
+	if !foundDefault {
+		t.Fatalf("did not find default route via %s", cfg.Gateway)
 	}
 }
 
-func TestPluginInNamespace_EndToEnd(t *testing.T) {
-	requireRootIntegration(t)
+func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
+	requireIntegration(t)
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	parentName := "dummyplug0"
-	nsName := "plugns1"
-	vlanIf := "dummyplug0.200"
-
-	cleanupLink(t, vlanIf)
-	cleanupLink(t, parentName)
-	_ = netns.DeleteNamed(nsName)
-
-	parent := &netlink.Dummy{
-		LinkAttrs: netlink.LinkAttrs{Name: parentName},
-	}
-	if err := netlink.LinkAdd(parent); err != nil {
-		t.Fatalf("failed to create dummy parent: %v", err)
-	}
-	t.Cleanup(func() {
-		cleanupLink(t, vlanIf)
-		cleanupLink(t, parentName)
-		_ = netns.DeleteNamed(nsName)
-	})
-
-	parentLink, err := netlink.LinkByName(parentName)
+	ipCmd, err := exec.LookPath("ip")
 	if err != nil {
-		t.Fatalf("failed to lookup parent link: %v", err)
-	}
-	if err := netlink.LinkSetUp(parentLink); err != nil {
-		t.Fatalf("failed to bring parent up: %v", err)
+		t.Skip("ip command not found")
 	}
 
-	ns := ensureNamespace(nsName)
-	defer ns.Close()
-
-	ensureVLANInHost(parentName, vlanIf, 200)
-	moveLinkToNamespaceIfNeeded(vlanIf, ns)
-	configureLinkInNamespace(ns, vlanIf, "10.20.0.2/24", "02:00:00:00:20:02", "")
-
-	testBin := buildTestBinary(t)
-
-	proc, err := startPlugin(testBin, t.TempDir(), NSConfig{
+	parentName := "dmy200"
+	nsName := "tns200"
+	cfg := NSConfig{
 		Name:       nsName,
 		VLANID:     200,
-		IfName:     vlanIf,
+		IfName:     parentName + ".200",
 		IPCIDR:     "10.20.0.2/24",
 		MAC:        "02:00:00:00:20:02",
 		Gateway:    "",
-		ListenPort: 18080,
-	})
-	if err != nil {
-		t.Fatalf("startPlugin failed: %v", err)
+		ListenPort: 18081,
 	}
+
+	cleanupHostLink(cfg.IfName)
+	cleanupHostLink(parentName)
+	_ = netns.DeleteNamed(nsName)
+
+	dummy := &netlink.Dummy{LinkAttrs: netlink.NewLinkAttrs()}
+	dummy.LinkAttrs.Name = parentName
+	if err := netlink.LinkAdd(dummy); err != nil {
+		t.Fatalf("create dummy parent failed: %v", err)
+	}
+	parent, err := netlink.LinkByName(parentName)
+	if err != nil {
+		t.Fatalf("lookup dummy parent failed: %v", err)
+	}
+	if err := netlink.LinkSetUp(parent); err != nil {
+		t.Fatalf("bring dummy parent up failed: %v", err)
+	}
+
+	ns, err := setupNamespaceNetwork(parentName, cfg)
+	if err != nil {
+		t.Fatalf("setupNamespaceNetwork failed: %v", err)
+	}
+
+	bin := buildPackageBinary(t)
+	proc, err := startNamespacePlugin(bin, ipCmd, t.TempDir(), cfg)
+	if err != nil {
+		t.Fatalf("startNamespacePlugin failed: %v", err)
+	}
+
 	t.Cleanup(func() {
-		if proc != nil && proc.client != nil {
-			proc.client.Kill()
-		}
+		proc.Stop()
+		_ = deleteLinkInNamespace(ns, cfg.IfName)
+		_ = ns.Close()
+		_ = netns.DeleteNamed(nsName)
+		cleanupHostLink(parentName)
+		cleanupHostLink(cfg.IfName)
 	})
 
-	hs, err := proc.rpc.Handshake()
+	desc, err := proc.rpc.Describe()
 	if err != nil {
-		t.Fatalf("Handshake failed: %v", err)
+		t.Fatalf("Describe failed: %v", err)
 	}
-	if hs.Namespace != nsName {
-		t.Fatalf("unexpected namespace from handshake: got %q want %q", hs.Namespace, nsName)
+	if desc.Namespace != nsName {
+		t.Fatalf("describe namespace mismatch: got %q want %q", desc.Namespace, nsName)
 	}
 
-	st, err := proc.rpc.Status()
+	status, err := proc.rpc.Status()
 	if err != nil {
 		t.Fatalf("Status failed: %v", err)
 	}
-	if !st.HTTPRunning {
-		t.Fatal("expected plugin HTTP server to be running")
+	if !status.HTTPRunning {
+		t.Fatal("expected HTTPRunning=true")
 	}
 
-	// Give the HTTP server a brief moment to start listening.
-	time.Sleep(200 * time.Millisecond)
+	waitForHTTP(t, func() (string, int, error) {
+		return httpGetInNamespace(ns, "http://127.0.0.1:18081/healthz")
+	})
 
-	body, code, err := httpGetInNamespace(ns, "http://127.0.0.1:18080/")
+	body, code, err := httpGetInNamespace(ns, "http://127.0.0.1:18081/")
 	if err != nil {
-		t.Fatalf("namespace-local GET failed: %v", err)
+		t.Fatalf("namespace GET / failed: %v", err)
 	}
 	if code != http.StatusOK {
 		t.Fatalf("unexpected status code: got %d", code)
@@ -247,14 +392,15 @@ func TestPluginInNamespace_EndToEnd(t *testing.T) {
 		t.Fatalf("unexpected body: %s", body)
 	}
 
-	healthBody, code, err := httpGetInNamespace(ns, "http://127.0.0.1:18080/healthz")
+	if err := proc.rpc.StopHTTP(); err != nil {
+		t.Fatalf("StopHTTP via rpc failed: %v", err)
+	}
+
+	status, err = proc.rpc.Status()
 	if err != nil {
-		t.Fatalf("healthz GET failed: %v", err)
+		t.Fatalf("Status after stop failed: %v", err)
 	}
-	if code != http.StatusOK {
-		t.Fatalf("unexpected /healthz status code: got %d", code)
-	}
-	if strings.TrimSpace(healthBody) != "ok" {
-		t.Fatalf("unexpected /healthz body: %q", healthBody)
+	if status.HTTPRunning {
+		t.Fatal("expected HTTPRunning=false after rpc stop")
 	}
 }
