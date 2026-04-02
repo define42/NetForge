@@ -3,7 +3,9 @@
 package main
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -54,22 +56,31 @@ func buildTestBinary(t *testing.T) string {
 }
 
 func httpGetInNamespace(ns netns.NsHandle, url string) (string, int, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
 
-	orig, err := netns.Get()
-	if err != nil {
-		return "", 0, err
-	}
-	defer orig.Close()
+			orig, err := netns.Get()
+			if err != nil {
+				return nil, err
+			}
+			defer orig.Close()
 
-	if err := netns.Set(ns); err != nil {
-		return "", 0, err
+			if err := netns.Set(ns); err != nil {
+				return nil, err
+			}
+			defer netns.Set(orig)
+
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
 	}
-	defer netns.Set(orig)
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{
-		Timeout: 3 * time.Second,
+		Timeout:   3 * time.Second,
+		Transport: transport,
 	}
 	resp, err := client.Get(url)
 	if err != nil {
