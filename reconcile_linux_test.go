@@ -101,7 +101,7 @@ func TestValidateHostConfig(t *testing.T) {
 			name:      "valid namespace characters",
 			parentNIC: "parent0",
 			configs: []NSConfig{{
-				Name:      "ns.Name_01-prod",
+				Name:      "ns_Name-01",
 				IfName:    "parent0.101",
 				IPCIDR:    "10.10.1.2/24",
 				OpenPorts: []int{8080},
@@ -156,6 +156,17 @@ func TestValidateHostConfig(t *testing.T) {
 			wantErr: `invalid namespace name "ns/1"`,
 		},
 		{
+			name:      "namespace name has dot",
+			parentNIC: "parent0",
+			configs: []NSConfig{{
+				Name:      "ns.1",
+				IfName:    "parent0.100",
+				IPCIDR:    "10.10.0.2/24",
+				OpenPorts: []int{80},
+			}},
+			wantErr: `invalid namespace name "ns.1"`,
+		},
+		{
 			name:      "namespace name too long",
 			parentNIC: "parent0",
 			configs: []NSConfig{{
@@ -164,7 +175,7 @@ func TestValidateHostConfig(t *testing.T) {
 				IPCIDR:    "10.10.0.2/24",
 				OpenPorts: []int{80},
 			}},
-			wantErr: `must match ^[A-Za-z0-9._-]{1,64}$`,
+			wantErr: `must match ^[A-Za-z0-9_-]{1,64}$`,
 		},
 		{
 			name:      "bad ip",

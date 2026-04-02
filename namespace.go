@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	validNamespaceName    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	validNamespaceName    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	namedNetnsDir         = "/run/netns"
 	hostLinkByName        = netlink.LinkByName
 	readDirEntries        = os.ReadDir
