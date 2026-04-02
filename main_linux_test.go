@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -86,7 +87,7 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 		MAC:        "02:00:00:00:42:42",
 		Gateway:    "192.0.2.1",
 		ListenPort: 8080,
-		OpenPort:   9090,
+		OpenPorts:  []int{9090, 9443},
 		AllowICMP:  true,
 	}
 
@@ -116,8 +117,8 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	if got.Gateway != cfg.Gateway {
 		t.Fatalf("gateway mismatch: got %q want %q", got.Gateway, cfg.Gateway)
 	}
-	if got.OpenPort != cfg.OpenPort {
-		t.Fatalf("open port mismatch: got %d want %d", got.OpenPort, cfg.OpenPort)
+	if !reflect.DeepEqual(got.OpenPorts, cfg.OpenPorts) {
+		t.Fatalf("open ports mismatch: got %v want %v", got.OpenPorts, cfg.OpenPorts)
 	}
 	if got.AllowICMP != cfg.AllowICMP {
 		t.Fatalf("allow icmp mismatch: got %t want %t", got.AllowICMP, cfg.AllowICMP)
@@ -125,7 +126,7 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 }
 
 func TestLoadPluginConfigFromEnvRejectsInvalidNamespaceName(t *testing.T) {
-	t.Setenv("NS_PLUGIN_CONFIG", `{"namespace":"../escape","interface":"eth0.42","ip_cidr":"192.0.2.10/24","open_port":8080}`)
+	t.Setenv("NS_PLUGIN_CONFIG", `{"namespace":"../escape","interface":"eth0.42","ip_cidr":"192.0.2.10/24","open_ports":[8080]}`)
 
 	_, err := loadPluginConfigFromEnv()
 	if err == nil {
@@ -156,7 +157,7 @@ func TestConfigHelpers(t *testing.T) {
 		if cfgs[0].IfName != "eth9.1" || cfgs[1].IfName != "eth9.2" {
 			t.Fatalf("unexpected default interfaces: %+v", cfgs)
 		}
-		if cfgs[0].OpenPort != cfgs[0].ListenPort || cfgs[1].OpenPort != cfgs[1].ListenPort {
+		if !reflect.DeepEqual(cfgs[0].OpenPorts, []int{cfgs[0].ListenPort}) || !reflect.DeepEqual(cfgs[1].OpenPorts, []int{cfgs[1].ListenPort}) {
 			t.Fatalf("expected default open ports to match listen ports: %+v", cfgs)
 		}
 	})
@@ -181,11 +182,25 @@ func TestConfigHelpers(t *testing.T) {
 		if len(cfgs) != 1 {
 			t.Fatalf("unexpected config count: got %d want %d", len(cfgs), 1)
 		}
-		if cfgs[0].OpenPort != 8088 {
-			t.Fatalf("expected open_port default from listen_port: %+v", cfgs[0])
+		if !reflect.DeepEqual(cfgs[0].OpenPorts, []int{8088}) {
+			t.Fatalf("expected open_ports default from listen_port: %+v", cfgs[0])
 		}
 		if !cfgs[0].AllowICMP {
 			t.Fatalf("expected allow_icmp=true: %+v", cfgs[0])
+		}
+	})
+
+	t.Run("loadConfigs explicit empty open ports", func(t *testing.T) {
+		t.Setenv("NS_CONFIG_JSON", `[{"name":"nsx","listen_port":8088,"open_ports":[]}]`)
+		cfgs, err := loadConfigs("ignored0")
+		if err != nil {
+			t.Fatalf("loadConfigs explicit empty open ports failed: %v", err)
+		}
+		if len(cfgs) != 1 {
+			t.Fatalf("unexpected config count: got %d want %d", len(cfgs), 1)
+		}
+		if !reflect.DeepEqual(cfgs[0].OpenPorts, []int{}) {
+			t.Fatalf("expected explicit empty open ports to be preserved: %+v", cfgs[0])
 		}
 	})
 
@@ -218,7 +233,7 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 			IPCIDR:      "192.0.2.10/24",
 			MAC:         "02:00:00:00:42:42",
 			Gateway:     "192.0.2.1",
-			OpenPort:    19090,
+			OpenPorts:   []int{19090, 19443},
 			AllowICMP:   true,
 			HTTPAddr:    ":19090",
 			HTTPRunning: true,
@@ -271,7 +286,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 		IPCIDR:    "192.0.2.10/24",
 		MAC:       "02:00:00:00:10:10",
 		Gateway:   "192.0.2.1",
-		OpenPort:  18080,
+		OpenPorts: []int{18080, 18443},
 		AllowICMP: true,
 	}}
 
@@ -319,8 +334,8 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	if !status.HTTPRunning {
 		t.Fatal("expected HTTPRunning=true")
 	}
-	if status.OpenPort != 18080 {
-		t.Fatalf("unexpected open port: got %d want %d", status.OpenPort, 18080)
+	if !reflect.DeepEqual(status.OpenPorts, []int{18080, 18443}) {
+		t.Fatalf("unexpected open ports: got %v want %v", status.OpenPorts, []int{18080, 18443})
 	}
 	if !status.AllowICMP {
 		t.Fatal("expected AllowICMP=true")
@@ -560,7 +575,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 					MAC:        "02:00:00:00:10:02",
 					Gateway:    "10.10.100.1",
 					ListenPort: 18080,
-					OpenPort:   19080,
+					OpenPorts:  []int{19080, 19443},
 					AllowICMP:  true,
 				},
 				rpc: &stubNamespaceService{
@@ -575,7 +590,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 						IPCIDR:      "10.10.100.2/24",
 						MAC:         "02:00:00:00:10:02",
 						Gateway:     "10.10.100.1",
-						OpenPort:    19080,
+						OpenPorts:   []int{19080, 19443},
 						AllowICMP:   true,
 						HTTPAddr:    ":18080",
 						HTTPRunning: true,
@@ -591,7 +606,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 					MAC:        "02:00:00:00:20:02",
 					Gateway:    "",
 					ListenPort: 18081,
-					OpenPort:   19081,
+					OpenPorts:  []int{19081},
 					AllowICMP:  false,
 				},
 				rpc: &stubNamespaceService{
@@ -642,8 +657,8 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		if payload.Namespaces[0].Name != "ns1" || !payload.Namespaces[0].HTTPRunning {
 			t.Fatalf("unexpected first namespace payload: %+v", payload.Namespaces[0])
 		}
-		if payload.Namespaces[0].OpenPort != 19080 {
-			t.Fatalf("unexpected first namespace open port: %+v", payload.Namespaces[0])
+		if !reflect.DeepEqual(payload.Namespaces[0].OpenPorts, []int{19080, 19443}) {
+			t.Fatalf("unexpected first namespace open ports: %+v", payload.Namespaces[0])
 		}
 		if !payload.Namespaces[0].AllowICMP {
 			t.Fatalf("expected first namespace allow_icmp=true: %+v", payload.Namespaces[0])
@@ -1249,7 +1264,7 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 		MAC:        "02:00:00:00:10:02",
 		Gateway:    "10.10.100.1",
 		ListenPort: 18080,
-		OpenPort:   19080,
+		OpenPorts:  []int{19080, 19443},
 		AllowICMP:  true,
 	}
 
@@ -1374,12 +1389,14 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 		t.Fatalf("unexpected second arp entry: %+v", arpEntries[1])
 	}
 
-	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPort)
-	if err != nil {
-		t.Fatalf("namespace firewall lookup failed: %v", err)
-	}
-	if !allowsPort {
-		t.Fatalf("namespace firewall did not allow tcp port %d", cfg.OpenPort)
+	for _, port := range cfg.OpenPorts {
+		allowsPort, err := namespaceFirewallAllowsTCPPort(ns, port)
+		if err != nil {
+			t.Fatalf("namespace firewall lookup failed for %d: %v", port, err)
+		}
+		if !allowsPort {
+			t.Fatalf("namespace firewall did not allow tcp port %d", port)
+		}
 	}
 
 	allowsICMP, err := namespaceFirewallAllowsProtocol(ns, unix.IPPROTO_ICMP)
@@ -1422,7 +1439,7 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 		MAC:        "02:00:00:00:20:02",
 		Gateway:    "",
 		ListenPort: listenPort,
-		OpenPort:   listenPort,
+		OpenPorts:  []int{listenPort},
 	}
 
 	cleanupHostLink(cfg.IfName)

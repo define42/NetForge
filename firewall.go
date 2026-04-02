@@ -176,7 +176,7 @@ func queueNamespaceFirewallRules(conn namespaceFirewallConn, table *nftables.Tab
 		}
 	}
 
-	if cfg.OpenPort != 0 {
+	for _, openPort := range cfg.OpenPorts {
 		conn.AddRule(&nftables.Rule{
 			Table: table,
 			Chain: input,
@@ -189,7 +189,7 @@ func queueNamespaceFirewallRules(conn namespaceFirewallConn, table *nftables.Tab
 					Offset:       2,
 					Len:          2,
 				},
-				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(uint16(cfg.OpenPort))},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(uint16(openPort))},
 				&expr.Verdict{Kind: expr.VerdictAccept},
 			},
 		})
@@ -197,8 +197,12 @@ func queueNamespaceFirewallRules(conn namespaceFirewallConn, table *nftables.Tab
 }
 
 func configureNamespaceFirewallWithConn(conn namespaceFirewallConn, cfg NSConfig) error {
-	if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
-		return fmt.Errorf("invalid open port %d", cfg.OpenPort)
+	cfg = normalizeNSConfig(cfg)
+
+	for _, port := range cfg.OpenPorts {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("invalid open port %d", port)
+		}
 	}
 
 	state, err := discoverNamespaceFirewallState(conn)
@@ -227,8 +231,10 @@ func configureNamespaceFirewallWithConn(conn namespaceFirewallConn, cfg NSConfig
 func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
 	cfg = normalizeNSConfig(cfg)
 
-	if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
-		return fmt.Errorf("invalid open port %d", cfg.OpenPort)
+	for _, port := range cfg.OpenPorts {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("invalid open port %d", port)
+		}
 	}
 
 	conn, err := newNamespaceFirewallConn(ns)

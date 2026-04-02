@@ -906,7 +906,7 @@ func setupPluginSandboxFixture(t *testing.T, suffix string) (NSConfig, netns.NsH
 		MAC:        "02:00:00:00:20:02",
 		Gateway:    "",
 		ListenPort: listenPort,
-		OpenPort:   listenPort,
+		OpenPorts:  []int{listenPort},
 	}
 
 	cleanupHostLink(cfg.IfName)

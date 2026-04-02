@@ -31,7 +31,7 @@ type hostNamespaceView struct {
 	MAC             string                `json:"mac"`
 	Gateway         string                `json:"gateway"`
 	ListenPort      int                   `json:"listen_port"`
-	OpenPort        int                   `json:"open_port"`
+	OpenPorts       []int                 `json:"open_ports"`
 	AllowICMP       bool                  `json:"allow_icmp"`
 	PluginHTTPAddr  string                `json:"plugin_http_addr"`
 	HTTPRunning     bool                  `json:"http_running"`
@@ -316,7 +316,7 @@ pre {
 <td><code>{{.IPCIDR}}</code><br><code>{{if .Gateway}}{{.Gateway}}{{else}}none{{end}}</code></td>
 <td><code>{{.MAC}}</code></td>
 <td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
-<td><code>{{if .OpenPort}}{{.OpenPort}}{{else}}none{{end}}</code></td>
+<td><code>{{if .OpenPorts}}{{range $i, $port := .OpenPorts}}{{if $i}}, {{end}}{{$port}}{{end}}{{else}}none{{end}}</code></td>
 <td><code>{{if .AllowICMP}}icmp enabled{{else}}icmp disabled{{end}}</code></td>
 <td>
 {{if .ARPError}}
@@ -379,7 +379,7 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 			MAC:        plugin.cfg.MAC,
 			Gateway:    plugin.cfg.Gateway,
 			ListenPort: plugin.cfg.ListenPort,
-			OpenPort:   plugin.cfg.OpenPort,
+			OpenPorts:  cloneOpenPorts(plugin.cfg.OpenPorts),
 			AllowICMP:  plugin.cfg.AllowICMP,
 		}
 
@@ -432,8 +432,8 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 		if status.Gateway != "" {
 			view.Gateway = status.Gateway
 		}
-		if status.OpenPort != 0 {
-			view.OpenPort = status.OpenPort
+		if status.OpenPorts != nil {
+			view.OpenPorts = cloneOpenPorts(status.OpenPorts)
 		}
 		view.AllowICMP = status.AllowICMP
 		if status.HTTPAddr != "" {

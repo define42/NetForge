@@ -83,7 +83,7 @@ func TestValidateHostConfig(t *testing.T) {
 		MAC:        "02:00:00:00:10:02",
 		Gateway:    "10.10.0.1",
 		ListenPort: 18080,
-		OpenPort:   18080,
+		OpenPorts:  []int{18080},
 	}
 
 	tests := []struct {
@@ -101,10 +101,10 @@ func TestValidateHostConfig(t *testing.T) {
 			name:      "valid namespace characters",
 			parentNIC: "parent0",
 			configs: []NSConfig{{
-				Name:     "ns.Name_01-prod",
-				IfName:   "parent0.101",
-				IPCIDR:   "10.10.1.2/24",
-				OpenPort: 8080,
+				Name:      "ns.Name_01-prod",
+				IfName:    "parent0.101",
+				IPCIDR:    "10.10.1.2/24",
+				OpenPorts: []int{8080},
 			}},
 		},
 		{
@@ -125,10 +125,10 @@ func TestValidateHostConfig(t *testing.T) {
 			configs: []NSConfig{
 				valid,
 				{
-					Name:     "ns2",
-					IfName:   valid.IfName,
-					IPCIDR:   "10.20.0.2/24",
-					OpenPort: 80,
+					Name:      "ns2",
+					IfName:    valid.IfName,
+					IPCIDR:    "10.20.0.2/24",
+					OpenPorts: []int{80},
 				},
 			},
 			wantErr: `duplicate interface name "parent0.100"`,
@@ -137,10 +137,10 @@ func TestValidateHostConfig(t *testing.T) {
 			name:      "empty namespace name",
 			parentNIC: "parent0",
 			configs: []NSConfig{{
-				Name:     "",
-				IfName:   "parent0.100",
-				IPCIDR:   "10.10.0.2/24",
-				OpenPort: 80,
+				Name:      "",
+				IfName:    "parent0.100",
+				IPCIDR:    "10.10.0.2/24",
+				OpenPorts: []int{80},
 			}},
 			wantErr: `invalid namespace name ""`,
 		},
@@ -148,10 +148,10 @@ func TestValidateHostConfig(t *testing.T) {
 			name:      "namespace name has slash",
 			parentNIC: "parent0",
 			configs: []NSConfig{{
-				Name:     "ns/1",
-				IfName:   "parent0.100",
-				IPCIDR:   "10.10.0.2/24",
-				OpenPort: 80,
+				Name:      "ns/1",
+				IfName:    "parent0.100",
+				IPCIDR:    "10.10.0.2/24",
+				OpenPorts: []int{80},
 			}},
 			wantErr: `invalid namespace name "ns/1"`,
 		},
@@ -159,10 +159,10 @@ func TestValidateHostConfig(t *testing.T) {
 			name:      "namespace name too long",
 			parentNIC: "parent0",
 			configs: []NSConfig{{
-				Name:     strings.Repeat("a", 65),
-				IfName:   "parent0.100",
-				IPCIDR:   "10.10.0.2/24",
-				OpenPort: 80,
+				Name:      strings.Repeat("a", 65),
+				IfName:    "parent0.100",
+				IPCIDR:    "10.10.0.2/24",
+				OpenPorts: []int{80},
 			}},
 			wantErr: `must match ^[A-Za-z0-9._-]{1,64}$`,
 		},
@@ -171,10 +171,10 @@ func TestValidateHostConfig(t *testing.T) {
 			parentNIC: "parent0",
 			configs: []NSConfig{
 				{
-					Name:     "ns1",
-					IfName:   "parent0.100",
-					IPCIDR:   "bad",
-					OpenPort: 80,
+					Name:      "ns1",
+					IfName:    "parent0.100",
+					IPCIDR:    "bad",
+					OpenPorts: []int{80},
 				},
 			},
 			wantErr: `parse ip "bad"`,
@@ -184,11 +184,11 @@ func TestValidateHostConfig(t *testing.T) {
 			parentNIC: "parent0",
 			configs: []NSConfig{
 				{
-					Name:     "ns1",
-					IfName:   "parent0.100",
-					IPCIDR:   "10.10.0.2/24",
-					MAC:      "bad-mac",
-					OpenPort: 80,
+					Name:      "ns1",
+					IfName:    "parent0.100",
+					IPCIDR:    "10.10.0.2/24",
+					MAC:       "bad-mac",
+					OpenPorts: []int{80},
 				},
 			},
 			wantErr: `parse mac "bad-mac"`,
@@ -198,11 +198,11 @@ func TestValidateHostConfig(t *testing.T) {
 			parentNIC: "parent0",
 			configs: []NSConfig{
 				{
-					Name:     "ns1",
-					IfName:   "parent0.100",
-					IPCIDR:   "10.10.0.2/24",
-					Gateway:  "bad-gateway",
-					OpenPort: 80,
+					Name:      "ns1",
+					IfName:    "parent0.100",
+					IPCIDR:    "10.10.0.2/24",
+					Gateway:   "bad-gateway",
+					OpenPorts: []int{80},
 				},
 			},
 			wantErr: `invalid gateway "bad-gateway"`,
@@ -212,10 +212,10 @@ func TestValidateHostConfig(t *testing.T) {
 			parentNIC: "parent0",
 			configs: []NSConfig{
 				{
-					Name:     "ns1",
-					IfName:   "parent0.100",
-					IPCIDR:   "10.10.0.2/24",
-					OpenPort: 70000,
+					Name:      "ns1",
+					IfName:    "parent0.100",
+					IPCIDR:    "10.10.0.2/24",
+					OpenPorts: []int{70000},
 				},
 			},
 			wantErr: `invalid open port 70000`,
@@ -343,7 +343,7 @@ func TestReconcileNamespacesRecreatesDriftedNamespace(t *testing.T) {
 		MAC:        "02:00:00:00:10:02",
 		Gateway:    "10.10.100.1",
 		ListenPort: 18080,
-		OpenPort:   18080,
+		OpenPorts:  []int{18080},
 	}
 	if _, err := reconcileNamespaces(parentName, runtimeBase, []NSConfig{initial}); err != nil {
 		t.Fatalf("initial reconcileNamespaces failed: %v", err)
@@ -456,7 +456,7 @@ func TestReconcileNamespacesRemovesStaleNamespaceAndRuntimeDir(t *testing.T) {
 		MAC:        "02:00:00:00:30:02",
 		Gateway:    "10.30.0.1",
 		ListenPort: 18081,
-		OpenPort:   18081,
+		OpenPorts:  []int{18081},
 	}
 	if _, err := reconcileNamespaces(parentName, runtimeBase, []NSConfig{cfg}); err != nil {
 		t.Fatalf("reconcileNamespaces failed: %v", err)
@@ -522,7 +522,7 @@ func TestRunHostReconcilesNamespacesAndStartsPlugins(t *testing.T) {
 		MAC:        "02:00:00:00:40:02",
 		Gateway:    "10.40.1.1",
 		ListenPort: listenPort,
-		OpenPort:   listenPort,
+		OpenPorts:  []int{listenPort},
 	}
 	if _, err := reconcileNamespaces(parentName, runtimeBase, []NSConfig{oldCfg}); err != nil {
 		t.Fatalf("seed reconcileNamespaces failed: %v", err)
@@ -629,7 +629,7 @@ func TestRunHostCleansRecreatedNamespacesOnStartupFailure(t *testing.T) {
 		MAC:        "02:00:00:00:50:02",
 		Gateway:    "10.50.0.1",
 		ListenPort: 18082,
-		OpenPort:   18082,
+		OpenPorts:  []int{18082},
 	}
 	cfg2 := NSConfig{
 		Name:       nsName + "2",
@@ -639,7 +639,7 @@ func TestRunHostCleansRecreatedNamespacesOnStartupFailure(t *testing.T) {
 		MAC:        "02:00:00:00:51:02",
 		Gateway:    "10.51.0.1",
 		ListenPort: 18083,
-		OpenPort:   18083,
+		OpenPorts:  []int{18083},
 	}
 
 	selfBinary := buildPackageBinary(t)

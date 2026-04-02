@@ -110,7 +110,7 @@ func firewallStateForNamespace(t *testing.T, ns netns.NsHandle) namespaceFirewal
 }
 
 func TestConfigureNamespaceFirewallWithConnMissingTable(t *testing.T) {
-	cfg := NSConfig{Name: "ns1", OpenPort: 8080, AllowICMP: true}
+	cfg := NSConfig{Name: "ns1", OpenPorts: []int{8080, 8443}, AllowICMP: true}
 	conn := &fakeNamespaceFirewallConn{}
 
 	if err := configureNamespaceFirewallWithConn(conn, cfg); err != nil {
@@ -120,6 +120,7 @@ func TestConfigureNamespaceFirewallWithConnMissingTable(t *testing.T) {
 	wantOps := []string{
 		"add-table:" + namespaceFirewallTableName,
 		"add-chain:" + namespaceFirewallInputName,
+		"add-rule",
 		"add-rule",
 		"add-rule",
 		"add-rule",
@@ -205,13 +206,13 @@ func TestConfigureNamespaceFirewallReconfigureIntegration(t *testing.T) {
 		cleanupNamespaceSet("", []string{nsName})
 	})
 
-	cfg := NSConfig{Name: nsName, OpenPort: 18080, AllowICMP: true}
+	cfg := NSConfig{Name: nsName, OpenPorts: []int{18080, 18443}, AllowICMP: true}
 	if err := configureNamespaceFirewall(ns, cfg); err != nil {
 		t.Fatalf("initial configureNamespaceFirewall failed: %v", err)
 	}
 
 	updated := cfg
-	updated.OpenPort = 0
+	updated.OpenPorts = []int{18443}
 	updated.AllowICMP = false
 	if err := configureNamespaceFirewall(ns, updated); err != nil {
 		t.Fatalf("updated configureNamespaceFirewall failed: %v", err)
@@ -225,12 +226,20 @@ func TestConfigureNamespaceFirewallReconfigureIntegration(t *testing.T) {
 		t.Fatalf("unexpected chain policy after reconfigure: %+v", state.inputChain.Policy)
 	}
 
-	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPort)
+	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPorts[0])
 	if err != nil {
 		t.Fatalf("namespaceFirewallAllowsTCPPort failed: %v", err)
 	}
 	if allowsPort {
-		t.Fatalf("stale tcp port %d remained allowed", cfg.OpenPort)
+		t.Fatalf("stale tcp port %d remained allowed", cfg.OpenPorts[0])
+	}
+
+	allowsPort, err = namespaceFirewallAllowsTCPPort(ns, updated.OpenPorts[0])
+	if err != nil {
+		t.Fatalf("namespaceFirewallAllowsTCPPort failed: %v", err)
+	}
+	if !allowsPort {
+		t.Fatalf("updated tcp port %d was not allowed", updated.OpenPorts[0])
 	}
 
 	allowsICMP, err := namespaceFirewallAllowsProtocol(ns, unix.IPPROTO_ICMP)
@@ -258,7 +267,7 @@ func TestConfigureNamespaceFirewallFlushFailurePreservesFirewall(t *testing.T) {
 		cleanupNamespaceSet("", []string{nsName})
 	})
 
-	cfg := NSConfig{Name: nsName, OpenPort: 19080, AllowICMP: true}
+	cfg := NSConfig{Name: nsName, OpenPorts: []int{19080}, AllowICMP: true}
 	if err := configureNamespaceFirewall(ns, cfg); err != nil {
 		t.Fatalf("initial configureNamespaceFirewall failed: %v", err)
 	}
@@ -280,7 +289,7 @@ func TestConfigureNamespaceFirewallFlushFailurePreservesFirewall(t *testing.T) {
 		}, nil
 	}
 
-	err = configureNamespaceFirewall(ns, NSConfig{Name: nsName, OpenPort: 0, AllowICMP: false})
+	err = configureNamespaceFirewall(ns, NSConfig{Name: nsName, OpenPorts: []int{}, AllowICMP: false})
 	if err == nil || !strings.Contains(err.Error(), "injected nftables flush failure") {
 		t.Fatalf("configureNamespaceFirewall error = %v, want injected flush failure", err)
 	}
@@ -293,12 +302,12 @@ func TestConfigureNamespaceFirewallFlushFailurePreservesFirewall(t *testing.T) {
 		t.Fatalf("unexpected chain policy after failed update: %+v", state.inputChain.Policy)
 	}
 
-	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPort)
+	allowsPort, err := namespaceFirewallAllowsTCPPort(ns, cfg.OpenPorts[0])
 	if err != nil {
 		t.Fatalf("namespaceFirewallAllowsTCPPort failed: %v", err)
 	}
 	if !allowsPort {
-		t.Fatalf("existing tcp port %d was not preserved after failed update", cfg.OpenPort)
+		t.Fatalf("existing tcp port %d was not preserved after failed update", cfg.OpenPorts[0])
 	}
 
 	allowsICMP, err := namespaceFirewallAllowsProtocol(ns, unix.IPPROTO_ICMP)
@@ -325,7 +334,7 @@ func TestConfigureNamespaceFirewallOpensConnectionError(t *testing.T) {
 }
 
 func TestConfigureNamespaceFirewallRejectsInvalidPort(t *testing.T) {
-	err := configureNamespaceFirewallWithConn(&fakeNamespaceFirewallConn{}, NSConfig{Name: "ns1", OpenPort: -1})
+	err := configureNamespaceFirewallWithConn(&fakeNamespaceFirewallConn{}, NSConfig{Name: "ns1", OpenPorts: []int{-1}})
 	if err == nil {
 		t.Fatal("configureNamespaceFirewallWithConn succeeded, want error")
 	}

@@ -99,7 +99,7 @@ export NS_CONFIG_JSON='[
     "mac": "02:00:00:00:10:02",
     "gateway": "10.10.100.1",
     "listen_port": 8080,
-    "open_port": 8080,
+    "open_ports": [8080],
     "allow_icmp": true
   },
   {
@@ -110,7 +110,7 @@ export NS_CONFIG_JSON='[
     "mac": "02:00:00:00:20:02",
     "gateway": "",
     "listen_port": 8081,
-    "open_port": 8081,
+    "open_ports": [8081],
     "allow_icmp": false
   }
 ]'
@@ -118,7 +118,7 @@ export NS_CONFIG_JSON='[
 sudo ./netforge
 ```
 
-If `open_port` is `0`, NetForge defaults it to `listen_port`.
+If `open_ports` is omitted or `null`, NetForge defaults it to `[listen_port]`. If `open_ports` is an explicit empty array, no TCP ports are opened.
 
 ## Default Behavior
 

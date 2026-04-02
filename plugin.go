@@ -124,7 +124,7 @@ func (s *namespaceHTTPService) Status() (*StatusResponse, error) {
 		IPCIDR:      s.cfg.IPCIDR,
 		MAC:         s.cfg.MAC,
 		Gateway:     s.cfg.Gateway,
-		OpenPort:    s.cfg.OpenPort,
+		OpenPorts:   cloneOpenPorts(s.cfg.OpenPorts),
 		AllowICMP:   s.cfg.AllowICMP,
 		HTTPAddr:    s.httpAddr,
 		HTTPRunning: s.httpServer != nil,

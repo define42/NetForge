@@ -35,10 +35,41 @@ func validateNamespaceName(name string) error {
 	return nil
 }
 
-func normalizeNSConfig(cfg NSConfig) NSConfig {
-	if cfg.OpenPort == 0 {
-		cfg.OpenPort = cfg.ListenPort
+func normalizeOpenPorts(listenPort int, openPorts []int) []int {
+	if openPorts == nil {
+		if listenPort == 0 {
+			return nil
+		}
+		return []int{listenPort}
 	}
+
+	if len(openPorts) == 0 {
+		return []int{}
+	}
+
+	normalized := append([]int(nil), openPorts...)
+	sort.Ints(normalized)
+
+	out := normalized[:0]
+	for i, port := range normalized {
+		if i == 0 || port != normalized[i-1] {
+			out = append(out, port)
+		}
+	}
+	return out
+}
+
+func cloneOpenPorts(openPorts []int) []int {
+	if openPorts == nil {
+		return nil
+	}
+	cloned := make([]int, len(openPorts))
+	copy(cloned, openPorts)
+	return cloned
+}
+
+func normalizeNSConfig(cfg NSConfig) NSConfig {
+	cfg.OpenPorts = normalizeOpenPorts(cfg.ListenPort, cfg.OpenPorts)
 	return cfg
 }
 
@@ -52,7 +83,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			MAC:        "02:00:00:00:01:01",
 			Gateway:    "192.168.1.1",
 			ListenPort: 8080,
-			OpenPort:   8080,
+			OpenPorts:  []int{8080},
 			AllowICMP:  false,
 		},
 		{
@@ -63,7 +94,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			MAC:        "02:00:00:00:02:02",
 			Gateway:    "192.168.2.1",
 			ListenPort: 8080,
-			OpenPort:   8080,
+			OpenPorts:  []int{8080},
 			AllowICMP:  true,
 		},
 	}
@@ -100,7 +131,7 @@ func pluginConfigJSON(cfg NSConfig) (string, error) {
 		IPCIDR:    cfg.IPCIDR,
 		MAC:       cfg.MAC,
 		Gateway:   cfg.Gateway,
-		OpenPort:  cfg.OpenPort,
+		OpenPorts: cloneOpenPorts(cfg.OpenPorts),
 		AllowICMP: cfg.AllowICMP,
 	})
 	if err != nil {
@@ -121,6 +152,12 @@ func loadPluginConfigFromEnv() (PluginConfig, error) {
 	}
 	if err := validateNamespaceName(cfg.Namespace); err != nil {
 		return PluginConfig{}, err
+	}
+	cfg.OpenPorts = normalizeOpenPorts(0, cfg.OpenPorts)
+	for _, port := range cfg.OpenPorts {
+		if port < 1 || port > 65535 {
+			return PluginConfig{}, fmt.Errorf("invalid open port %d for namespace %q", port, cfg.Namespace)
+		}
 	}
 	return cfg, nil
 }
@@ -161,8 +198,10 @@ func validateHostConfig(parentNIC string, configs []NSConfig) error {
 		if cfg.Gateway != "" && net.ParseIP(cfg.Gateway) == nil {
 			return fmt.Errorf("invalid gateway %q for namespace %q", cfg.Gateway, cfg.Name)
 		}
-		if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
-			return fmt.Errorf("invalid open port %d for namespace %q", cfg.OpenPort, cfg.Name)
+		for _, port := range cfg.OpenPorts {
+			if port < 1 || port > 65535 {
+				return fmt.Errorf("invalid open port %d for namespace %q", port, cfg.Name)
+			}
 		}
 	}
 

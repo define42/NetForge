@@ -18,7 +18,7 @@ type NSConfig struct {
 	MAC        string `json:"mac"`
 	Gateway    string `json:"gateway"`
 	ListenPort int    `json:"listen_port"`
-	OpenPort   int    `json:"open_port"`
+	OpenPorts  []int  `json:"open_ports"`
 	AllowICMP  bool   `json:"allow_icmp"`
 }
 
@@ -28,7 +28,7 @@ type PluginConfig struct {
 	IPCIDR    string `json:"ip_cidr"`
 	MAC       string `json:"mac"`
 	Gateway   string `json:"gateway"`
-	OpenPort  int    `json:"open_port"`
+	OpenPorts []int  `json:"open_ports"`
 	AllowICMP bool   `json:"allow_icmp"`
 }
 
@@ -48,7 +48,7 @@ type StatusResponse struct {
 	IPCIDR      string
 	MAC         string
 	Gateway     string
-	OpenPort    int
+	OpenPorts   []int
 	AllowICMP   bool
 	HTTPAddr    string
 	HTTPRunning bool
