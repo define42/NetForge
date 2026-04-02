@@ -186,6 +186,12 @@ func validateHostConfig(parentNIC string, configs []NSConfig) error {
 			return fmt.Errorf("duplicate interface name %q", cfg.IfName)
 		}
 		seenInterfaces[cfg.IfName] = struct{}{}
+		if cfg.VLANID < 1 || cfg.VLANID > 4094 {
+			return fmt.Errorf("invalid vlan id %d for namespace %q", cfg.VLANID, cfg.Name)
+		}
+		if cfg.ListenPort < 1 || cfg.ListenPort > 65535 {
+			return fmt.Errorf("invalid listen port %d for namespace %q", cfg.ListenPort, cfg.Name)
+		}
 
 		if _, err := netlink.ParseAddr(cfg.IPCIDR); err != nil {
 			return fmt.Errorf("parse ip %q for namespace %q: %w", cfg.IPCIDR, cfg.Name, err)
