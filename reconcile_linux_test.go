@@ -98,6 +98,16 @@ func TestValidateHostConfig(t *testing.T) {
 			configs:   []NSConfig{valid},
 		},
 		{
+			name:      "valid namespace characters",
+			parentNIC: "parent0",
+			configs: []NSConfig{{
+				Name:     "ns.Name_01-prod",
+				IfName:   "parent0.101",
+				IPCIDR:   "10.10.1.2/24",
+				OpenPort: 8080,
+			}},
+		},
+		{
 			name:      "missing parent",
 			parentNIC: "missing0",
 			configs:   []NSConfig{valid},
@@ -122,6 +132,39 @@ func TestValidateHostConfig(t *testing.T) {
 				},
 			},
 			wantErr: `duplicate interface name "parent0.100"`,
+		},
+		{
+			name:      "empty namespace name",
+			parentNIC: "parent0",
+			configs: []NSConfig{{
+				Name:     "",
+				IfName:   "parent0.100",
+				IPCIDR:   "10.10.0.2/24",
+				OpenPort: 80,
+			}},
+			wantErr: `invalid namespace name ""`,
+		},
+		{
+			name:      "namespace name has slash",
+			parentNIC: "parent0",
+			configs: []NSConfig{{
+				Name:     "ns/1",
+				IfName:   "parent0.100",
+				IPCIDR:   "10.10.0.2/24",
+				OpenPort: 80,
+			}},
+			wantErr: `invalid namespace name "ns/1"`,
+		},
+		{
+			name:      "namespace name too long",
+			parentNIC: "parent0",
+			configs: []NSConfig{{
+				Name:     strings.Repeat("a", 65),
+				IfName:   "parent0.100",
+				IPCIDR:   "10.10.0.2/24",
+				OpenPort: 80,
+			}},
+			wantErr: `must match ^[A-Za-z0-9._-]{1,64}$`,
 		},
 		{
 			name:      "bad ip",

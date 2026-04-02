@@ -124,6 +124,18 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadPluginConfigFromEnvRejectsInvalidNamespaceName(t *testing.T) {
+	t.Setenv("NS_PLUGIN_CONFIG", `{"namespace":"../escape","interface":"eth0.42","ip_cidr":"192.0.2.10/24","open_port":8080}`)
+
+	_, err := loadPluginConfigFromEnv()
+	if err == nil {
+		t.Fatal("loadPluginConfigFromEnv succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), `invalid namespace name "../escape"`) {
+		t.Fatalf("loadPluginConfigFromEnv error = %v, want invalid namespace name", err)
+	}
+}
+
 func TestConfigHelpers(t *testing.T) {
 	t.Run("envDefault", func(t *testing.T) {
 		if got := envDefault("NETFORGE_TEST_ENV_DEFAULT", "fallback"); got != "fallback" {

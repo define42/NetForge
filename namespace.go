@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 
@@ -18,6 +19,7 @@ import (
 )
 
 var (
+	validNamespaceName    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 	namedNetnsDir         = "/run/netns"
 	hostLinkByName        = netlink.LinkByName
 	readDirEntries        = os.ReadDir
@@ -25,6 +27,13 @@ var (
 	destroyNamespaceLinks = destroyNamespaceLinksInNetns
 	deleteNamedNamespace  = netns.DeleteNamed
 )
+
+func validateNamespaceName(name string) error {
+	if !validNamespaceName.MatchString(name) {
+		return fmt.Errorf("invalid namespace name %q: must match %s", name, validNamespaceName.String())
+	}
+	return nil
+}
 
 func normalizeNSConfig(cfg NSConfig) NSConfig {
 	if cfg.OpenPort == 0 {
@@ -81,6 +90,9 @@ func loadConfigs(parentNIC string) ([]NSConfig, error) {
 
 func pluginConfigJSON(cfg NSConfig) (string, error) {
 	cfg = normalizeNSConfig(cfg)
+	if err := validateNamespaceName(cfg.Name); err != nil {
+		return "", err
+	}
 
 	raw, err := json.Marshal(PluginConfig{
 		Namespace: cfg.Name,
@@ -107,6 +119,9 @@ func loadPluginConfigFromEnv() (PluginConfig, error) {
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		return PluginConfig{}, fmt.Errorf("parse NS_PLUGIN_CONFIG: %w", err)
 	}
+	if err := validateNamespaceName(cfg.Namespace); err != nil {
+		return PluginConfig{}, err
+	}
 	return cfg, nil
 }
 
@@ -120,8 +135,8 @@ func validateHostConfig(parentNIC string, configs []NSConfig) error {
 	for _, rawCfg := range configs {
 		cfg := normalizeNSConfig(rawCfg)
 
-		if cfg.Name == "" {
-			return errors.New("namespace name must not be empty")
+		if err := validateNamespaceName(cfg.Name); err != nil {
+			return err
 		}
 		if cfg.IfName == "" {
 			return fmt.Errorf("interface name must not be empty for namespace %q", cfg.Name)
