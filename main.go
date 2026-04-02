@@ -44,6 +44,7 @@ type NSConfig struct {
 	Gateway    string `json:"gateway"`
 	ListenPort int    `json:"listen_port"`
 	OpenPort   int    `json:"open_port"`
+	AllowICMP  bool   `json:"allow_icmp"`
 }
 
 type PluginConfig struct {
@@ -53,6 +54,7 @@ type PluginConfig struct {
 	MAC       string `json:"mac"`
 	Gateway   string `json:"gateway"`
 	OpenPort  int    `json:"open_port"`
+	AllowICMP bool   `json:"allow_icmp"`
 }
 
 type DescribeResponse struct {
@@ -72,6 +74,7 @@ type StatusResponse struct {
 	MAC         string
 	Gateway     string
 	OpenPort    int
+	AllowICMP   bool
 	HTTPAddr    string
 	HTTPRunning bool
 }
@@ -196,6 +199,7 @@ type hostNamespaceView struct {
 	Gateway         string                `json:"gateway"`
 	ListenPort      int                   `json:"listen_port"`
 	OpenPort        int                   `json:"open_port"`
+	AllowICMP       bool                  `json:"allow_icmp"`
 	PluginHTTPAddr  string                `json:"plugin_http_addr"`
 	HTTPRunning     bool                  `json:"http_running"`
 	Message         string                `json:"message"`
@@ -316,6 +320,7 @@ code {
 <th>MAC</th>
 <th>Plugin HTTP</th>
 <th>Open TCP</th>
+<th>ICMP</th>
 <th>NIC Statistics</th>
 <th>Status</th>
 </tr>
@@ -330,6 +335,7 @@ code {
 <td><code>{{.MAC}}</code></td>
 <td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
 <td><code>{{if .OpenPort}}{{.OpenPort}}{{else}}none{{end}}</code></td>
+<td><code>{{if .AllowICMP}}icmp enabled{{else}}icmp disabled{{end}}</code></td>
 <td>
 {{if .StatisticsError}}
 <span class="status-bad">{{.StatisticsError}}</span>
@@ -377,6 +383,7 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 			Gateway:    plugin.cfg.Gateway,
 			ListenPort: plugin.cfg.ListenPort,
 			OpenPort:   plugin.cfg.OpenPort,
+			AllowICMP:  plugin.cfg.AllowICMP,
 		}
 
 		stats, statsErr := statsLookup(plugin.cfg.Name, plugin.cfg.IfName)
@@ -424,6 +431,7 @@ func (s *hostDashboardService) snapshot() hostDashboardData {
 		if status.OpenPort != 0 {
 			view.OpenPort = status.OpenPort
 		}
+		view.AllowICMP = status.AllowICMP
 		if status.HTTPAddr != "" {
 			view.PluginHTTPAddr = status.HTTPAddr
 		}
@@ -550,6 +558,20 @@ func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
 			&expr.Verdict{Kind: expr.VerdictAccept},
 		},
 	})
+
+	if cfg.AllowICMP {
+		for _, proto := range []byte{unix.IPPROTO_ICMP, unix.IPPROTO_ICMPV6} {
+			conn.AddRule(&nftables.Rule{
+				Table: table,
+				Chain: input,
+				Exprs: []expr.Any{
+					&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}},
+					&expr.Verdict{Kind: expr.VerdictAccept},
+				},
+			})
+		}
+	}
 
 	if cfg.OpenPort != 0 {
 		conn.AddRule(&nftables.Rule{
@@ -720,6 +742,7 @@ func (s *namespaceHTTPService) Status() (*StatusResponse, error) {
 		MAC:         s.cfg.MAC,
 		Gateway:     s.cfg.Gateway,
 		OpenPort:    s.cfg.OpenPort,
+		AllowICMP:   s.cfg.AllowICMP,
 		HTTPAddr:    s.httpAddr,
 		HTTPRunning: s.httpServer != nil,
 	}, nil
@@ -906,6 +929,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			Gateway:    "192.168.1.1",
 			ListenPort: 8080,
 			OpenPort:   8080,
+			AllowICMP:  false,
 		},
 		{
 			Name:       "ns2",
@@ -916,6 +940,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			Gateway:    "192.168.2.1",
 			ListenPort: 8080,
 			OpenPort:   8080,
+			AllowICMP:  false,
 		},
 	}
 }
@@ -949,6 +974,7 @@ func pluginConfigJSON(cfg NSConfig) (string, error) {
 		MAC:       cfg.MAC,
 		Gateway:   cfg.Gateway,
 		OpenPort:  cfg.OpenPort,
+		AllowICMP: cfg.AllowICMP,
 	})
 	if err != nil {
 		return "", err

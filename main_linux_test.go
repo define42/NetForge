@@ -74,6 +74,7 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 		Gateway:    "192.0.2.1",
 		ListenPort: 8080,
 		OpenPort:   9090,
+		AllowICMP:  true,
 	}
 
 	raw, err := pluginConfigJSON(cfg)
@@ -105,6 +106,9 @@ func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	if got.OpenPort != cfg.OpenPort {
 		t.Fatalf("open port mismatch: got %d want %d", got.OpenPort, cfg.OpenPort)
 	}
+	if got.AllowICMP != cfg.AllowICMP {
+		t.Fatalf("allow icmp mismatch: got %t want %t", got.AllowICMP, cfg.AllowICMP)
+	}
 }
 
 func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
@@ -115,6 +119,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 		MAC:       "02:00:00:00:10:10",
 		Gateway:   "192.0.2.1",
 		OpenPort:  18080,
+		AllowICMP: true,
 	}}
 
 	start, err := svc.StartHTTP(18080)
@@ -147,6 +152,9 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	}
 	if status.OpenPort != 18080 {
 		t.Fatalf("unexpected open port: got %d want %d", status.OpenPort, 18080)
+	}
+	if !status.AllowICMP {
+		t.Fatal("expected AllowICMP=true")
 	}
 
 	resp, err := http.Get("http://127.0.0.1:18080/")
@@ -210,6 +218,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 					Gateway:    "10.10.100.1",
 					ListenPort: 18080,
 					OpenPort:   19080,
+					AllowICMP:  true,
 				},
 				rpc: &stubNamespaceService{
 					describe: &DescribeResponse{
@@ -224,6 +233,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 						MAC:         "02:00:00:00:10:02",
 						Gateway:     "10.10.100.1",
 						OpenPort:    19080,
+						AllowICMP:   true,
 						HTTPAddr:    ":18080",
 						HTTPRunning: true,
 					},
@@ -239,6 +249,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 					Gateway:    "",
 					ListenPort: 18081,
 					OpenPort:   19081,
+					AllowICMP:  false,
 				},
 				rpc: &stubNamespaceService{
 					describeErr: errors.New("plugin down"),
@@ -258,7 +269,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 
 		body := rec.Body.String()
-		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "19080", "rx bytes 1024", "tx drop 4", "ns2", "19081", "statistics unavailable", "plugin down"} {
+		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "statistics unavailable", "plugin down"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("dashboard body did not contain %q: %s", want, body)
 			}
@@ -291,8 +302,14 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		if payload.Namespaces[0].OpenPort != 19080 {
 			t.Fatalf("unexpected first namespace open port: %+v", payload.Namespaces[0])
 		}
+		if !payload.Namespaces[0].AllowICMP {
+			t.Fatalf("expected first namespace allow_icmp=true: %+v", payload.Namespaces[0])
+		}
 		if payload.Namespaces[0].Statistics.RxBytes != 1024 || payload.Namespaces[0].Statistics.TxDropped != 4 {
 			t.Fatalf("unexpected first namespace statistics: %+v", payload.Namespaces[0].Statistics)
+		}
+		if payload.Namespaces[1].AllowICMP {
+			t.Fatalf("expected second namespace allow_icmp=false: %+v", payload.Namespaces[1])
 		}
 		if payload.Namespaces[1].Error == "" {
 			t.Fatalf("expected second namespace error, got %+v", payload.Namespaces[1])
@@ -457,6 +474,26 @@ func nftRuleAcceptsTCPPort(rule *nftables.Rule, port int) bool {
 	return sawTCP && sawPort && sawAccept
 }
 
+func nftRuleAcceptsProtocol(rule *nftables.Rule, proto byte) bool {
+	sawProto := false
+	sawAccept := false
+
+	for _, expression := range rule.Exprs {
+		switch exprValue := expression.(type) {
+		case *expr.Cmp:
+			if bytes.Equal(exprValue.Data, []byte{proto}) {
+				sawProto = true
+			}
+		case *expr.Verdict:
+			if exprValue.Kind == expr.VerdictAccept {
+				sawAccept = true
+			}
+		}
+	}
+
+	return sawProto && sawAccept
+}
+
 func namespaceFirewallAllowsTCPPort(ns netns.NsHandle, port int) (bool, error) {
 	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
 	if err != nil {
@@ -485,6 +522,37 @@ func namespaceFirewallAllowsTCPPort(ns netns.NsHandle, port int) (bool, error) {
 	}
 	for _, rule := range rules {
 		if nftRuleAcceptsTCPPort(rule, port) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func namespaceFirewallAllowsProtocol(ns netns.NsHandle, proto byte) (bool, error) {
+	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
+	if err != nil {
+		return false, err
+	}
+
+	table, err := lookupNFTablesTable(conn, nftables.TableFamilyINet, namespaceFirewallTableName)
+	if err != nil {
+		return false, err
+	}
+	if table == nil {
+		return false, nil
+	}
+
+	chain, err := conn.ListChain(table, namespaceFirewallInputName)
+	if err != nil {
+		return false, err
+	}
+
+	rules, err := conn.GetRules(table, chain)
+	if err != nil {
+		return false, err
+	}
+	for _, rule := range rules {
+		if nftRuleAcceptsProtocol(rule, proto) {
 			return true, nil
 		}
 	}
@@ -521,6 +589,7 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 		Gateway:    "10.10.100.1",
 		ListenPort: 18080,
 		OpenPort:   19080,
+		AllowICMP:  true,
 	}
 
 	cleanupHostLink(cfg.IfName)
@@ -603,6 +672,22 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 	}
 	if !allowsPort {
 		t.Fatalf("namespace firewall did not allow tcp port %d", cfg.OpenPort)
+	}
+
+	allowsICMP, err := namespaceFirewallAllowsProtocol(ns, unix.IPPROTO_ICMP)
+	if err != nil {
+		t.Fatalf("namespace firewall icmp lookup failed: %v", err)
+	}
+	if !allowsICMP {
+		t.Fatal("namespace firewall did not allow icmp")
+	}
+
+	allowsICMPv6, err := namespaceFirewallAllowsProtocol(ns, unix.IPPROTO_ICMPV6)
+	if err != nil {
+		t.Fatalf("namespace firewall icmpv6 lookup failed: %v", err)
+	}
+	if !allowsICMPv6 {
+		t.Fatal("namespace firewall did not allow icmpv6")
 	}
 }
 
