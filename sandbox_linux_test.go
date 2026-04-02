@@ -824,6 +824,12 @@ func assertPluginSandboxed(t *testing.T, proc *runningPlugin) {
 	if rootStat.Dev != sandboxStat.Dev || rootStat.Ino != sandboxStat.Ino {
 		t.Fatalf("sandbox root mismatch: proc dev/inode=%d/%d sandbox dev/inode=%d/%d", rootStat.Dev, rootStat.Ino, sandboxStat.Dev, sandboxStat.Ino)
 	}
+	if proc.cgroup == nil {
+		t.Fatal("expected plugin cgroup to be configured")
+	}
+	if got := readUnifiedProcCgroupPath(t, proc.pid); got != proc.cgroup.Path() {
+		t.Fatalf("sandbox cgroup mismatch: got %q want %q", got, proc.cgroup.Path())
+	}
 
 	status := readProcStatus(t, proc.pid)
 	if status["NoNewPrivs"] != "1" {
@@ -925,6 +931,24 @@ func readProcStatus(t *testing.T, pid int) map[string]string {
 		t.Fatalf("scan proc status failed: %v", err)
 	}
 	return status
+}
+
+func readUnifiedProcCgroupPath(t *testing.T, pid int) string {
+	t.Helper()
+
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		t.Fatalf("read proc cgroup failed: %v", err)
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 && parts[0] == "0" && parts[1] == "" {
+			return parts[2]
+		}
+	}
+	t.Fatalf("did not find unified cgroup entry in /proc/%d/cgroup", pid)
+	return ""
 }
 
 func mustReadlink(t *testing.T, path string) string {

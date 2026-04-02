@@ -1185,6 +1185,7 @@ type runningPlugin struct {
 	rpc     NamespaceService
 	pid     int
 	sandbox pluginSandboxSpec
+	cgroup  pluginCgroup
 }
 
 type namespaceCmdRunner struct {
@@ -1192,6 +1193,7 @@ type namespaceCmdRunner struct {
 	cmd       *exec.Cmd
 	namespace string
 	sandbox   pluginSandboxSpec
+	cgroup    pluginCgroup
 
 	stdout io.ReadCloser
 	stderr io.ReadCloser
@@ -1268,6 +1270,11 @@ func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string,
 		return nil, err
 	}
 
+	cgroup, err := pluginCgroupFactory(namespace)
+	if err != nil {
+		return nil, err
+	}
+
 	displayPath := cmd.Path
 	if len(cmd.Args) > 0 && cmd.Args[0] != "" {
 		displayPath = cmd.Args[0]
@@ -1278,6 +1285,7 @@ func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string,
 		cmd:       cmd,
 		namespace: namespace,
 		sandbox:   sandbox,
+		cgroup:    cgroup,
 		stdout:    stdout,
 		stderr:    stderr,
 		path:      displayPath,
@@ -1285,13 +1293,36 @@ func newNamespaceCmdRunner(logger hclog.Logger, cmd *exec.Cmd, namespace string,
 }
 
 func (r *namespaceCmdRunner) Start(_ context.Context) error {
-	r.logger.Debug("starting plugin", "path", r.cmd.Path, "args", r.cmd.Args, "namespace", r.namespace, "sandbox_root", r.sandbox.rootDir)
+	cgroupPath := ""
+	if r.cgroup != nil {
+		cgroupPath = r.cgroup.Path()
+	}
+	r.logger.Debug("starting plugin", "path", r.cmd.Path, "args", r.cmd.Args, "namespace", r.namespace, "sandbox_root", r.sandbox.rootDir, "cgroup", cgroupPath)
 	if err := startCmdInNamedNamespace(r.cmd, r.namespace); err != nil {
+		cleanupPluginCgroup(r.cgroup)
 		return err
 	}
 
 	r.pid = r.cmd.Process.Pid
-	r.logger.Debug("plugin started", "path", r.path, "pid", r.pid, "namespace", r.namespace)
+	if err := r.attachToCgroup(); err != nil {
+		return err
+	}
+	r.logger.Debug("plugin started", "path", r.path, "pid", r.pid, "namespace", r.namespace, "cgroup", cgroupPath)
+	return nil
+}
+
+func (r *namespaceCmdRunner) attachToCgroup() error {
+	if r.cgroup == nil || r.cmd == nil || r.cmd.Process == nil {
+		return nil
+	}
+
+	pid := uint64(r.cmd.Process.Pid)
+	if err := r.cgroup.AddProc(pid); err != nil {
+		_ = r.cmd.Process.Kill()
+		_ = r.cmd.Wait()
+		cleanupPluginCgroup(r.cgroup)
+		return fmt.Errorf("add plugin pid %d to cgroup %q: %w", pid, r.cgroup.Path(), err)
+	}
 	return nil
 }
 
@@ -1350,6 +1381,11 @@ func (p *runningPlugin) Stop() {
 	}
 	if p.client != nil {
 		p.client.Kill()
+		p.client = nil
+	}
+	if p.cgroup != nil {
+		cleanupPluginCgroup(p.cgroup)
+		p.cgroup = nil
 	}
 }
 
@@ -1753,23 +1789,35 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 	rpcClient, err := client.Client()
 	if err != nil {
 		client.Kill()
+		if cmdRunner != nil {
+			cleanupPluginCgroup(cmdRunner.cgroup)
+		}
 		return nil, fmt.Errorf("connect plugin for %s: %w", cfg.Name, err)
 	}
 
 	raw, err := rpcClient.Dispense(pluginName)
 	if err != nil {
 		client.Kill()
+		if cmdRunner != nil {
+			cleanupPluginCgroup(cmdRunner.cgroup)
+		}
 		return nil, fmt.Errorf("dispense plugin for %s: %w", cfg.Name, err)
 	}
 
 	svc, ok := raw.(NamespaceService)
 	if !ok {
 		client.Kill()
+		if cmdRunner != nil {
+			cleanupPluginCgroup(cmdRunner.cgroup)
+		}
 		return nil, fmt.Errorf("dispensed plugin has type %T, want NamespaceService", raw)
 	}
 
 	if _, err := svc.StartHTTP(cfg.ListenPort); err != nil {
 		client.Kill()
+		if cmdRunner != nil {
+			cleanupPluginCgroup(cmdRunner.cgroup)
+		}
 		return nil, fmt.Errorf("start namespace http server in %s: %w", cfg.Name, err)
 	}
 
@@ -1777,6 +1825,7 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 	if cmdRunner != nil {
 		rp.pid = cmdRunner.pid
 		rp.sandbox = cmdRunner.sandbox
+		rp.cgroup = cmdRunner.cgroup
 	}
 	return rp, nil
 }
