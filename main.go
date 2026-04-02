@@ -549,16 +549,6 @@ func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
 		},
 	})
 
-	conn.AddRule(&nftables.Rule{
-		Table: table,
-		Chain: input,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: nftablesInterfaceName("lo")},
-			&expr.Verdict{Kind: expr.VerdictAccept},
-		},
-	})
-
 	if cfg.AllowICMP {
 		for _, proto := range []byte{unix.IPPROTO_ICMP, unix.IPPROTO_ICMPV6} {
 			conn.AddRule(&nftables.Rule{
@@ -940,7 +930,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			Gateway:    "192.168.2.1",
 			ListenPort: 8080,
 			OpenPort:   8080,
-			AllowICMP:  false,
+			AllowICMP:  true,
 		},
 	}
 }

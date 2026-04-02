@@ -494,6 +494,26 @@ func nftRuleAcceptsProtocol(rule *nftables.Rule, proto byte) bool {
 	return sawProto && sawAccept
 }
 
+func nftRuleAcceptsLoopback(rule *nftables.Rule) bool {
+	sawLoopback := false
+	sawAccept := false
+
+	for _, expression := range rule.Exprs {
+		switch exprValue := expression.(type) {
+		case *expr.Cmp:
+			if bytes.Equal(exprValue.Data, nftablesInterfaceName("lo")) {
+				sawLoopback = true
+			}
+		case *expr.Verdict:
+			if exprValue.Kind == expr.VerdictAccept {
+				sawAccept = true
+			}
+		}
+	}
+
+	return sawLoopback && sawAccept
+}
+
 func namespaceFirewallAllowsTCPPort(ns netns.NsHandle, port int) (bool, error) {
 	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
 	if err != nil {
@@ -553,6 +573,37 @@ func namespaceFirewallAllowsProtocol(ns netns.NsHandle, proto byte) (bool, error
 	}
 	for _, rule := range rules {
 		if nftRuleAcceptsProtocol(rule, proto) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func namespaceFirewallAllowsLoopback(ns netns.NsHandle) (bool, error) {
+	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
+	if err != nil {
+		return false, err
+	}
+
+	table, err := lookupNFTablesTable(conn, nftables.TableFamilyINet, namespaceFirewallTableName)
+	if err != nil {
+		return false, err
+	}
+	if table == nil {
+		return false, nil
+	}
+
+	chain, err := conn.ListChain(table, namespaceFirewallInputName)
+	if err != nil {
+		return false, err
+	}
+
+	rules, err := conn.GetRules(table, chain)
+	if err != nil {
+		return false, err
+	}
+	for _, rule := range rules {
+		if nftRuleAcceptsLoopback(rule) {
 			return true, nil
 		}
 	}
@@ -688,6 +739,14 @@ func TestSetupNamespaceNetworkWithDummyParent(t *testing.T) {
 	}
 	if !allowsICMPv6 {
 		t.Fatal("namespace firewall did not allow icmpv6")
+	}
+
+	allowsLoopback, err := namespaceFirewallAllowsLoopback(ns)
+	if err != nil {
+		t.Fatalf("namespace firewall loopback lookup failed: %v", err)
+	}
+	if allowsLoopback {
+		t.Fatal("namespace firewall unexpectedly bypassed loopback traffic")
 	}
 }
 
