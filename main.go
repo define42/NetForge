@@ -728,43 +728,115 @@ func lookupNFTablesTable(conn *nftables.Conn, family nftables.TableFamily, name 
 	return nil, nil
 }
 
-func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
-	cfg = normalizeNSConfig(cfg)
+type nftablesTableLister interface {
+	ListTablesOfFamily(family nftables.TableFamily) ([]*nftables.Table, error)
+}
 
-	if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
-		return fmt.Errorf("invalid open port %d", cfg.OpenPort)
-	}
+type namespaceFirewallConn interface {
+	nftablesTableLister
+	ListChainsOfTableFamily(family nftables.TableFamily) ([]*nftables.Chain, error)
+	AddTable(t *nftables.Table) *nftables.Table
+	AddChain(c *nftables.Chain) *nftables.Chain
+	AddRule(r *nftables.Rule) *nftables.Rule
+	DelTable(t *nftables.Table)
+	FlushChain(c *nftables.Chain)
+	Flush() error
+}
 
-	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
+type namespaceFirewallState struct {
+	table        *nftables.Table
+	inputChain   *nftables.Chain
+	replaceTable bool
+}
+
+var newNamespaceFirewallConn = func(ns netns.NsHandle) (namespaceFirewallConn, error) {
+	return nftables.New(nftables.WithNetNSFd(int(ns)))
+}
+
+func lookupNFTablesTableByFamily(conn nftablesTableLister, family nftables.TableFamily, name string) (*nftables.Table, error) {
+	tables, err := conn.ListTablesOfFamily(family)
 	if err != nil {
-		return fmt.Errorf("open nftables connection in %s: %w", cfg.Name, err)
+		return nil, err
 	}
-
-	existing, err := lookupNFTablesTable(conn, nftables.TableFamilyINet, namespaceFirewallTableName)
-	if err != nil {
-		return fmt.Errorf("list nftables tables in %s: %w", cfg.Name, err)
-	}
-	if existing != nil {
-		conn.DelTable(existing)
-		if err := conn.Flush(); err != nil {
-			return fmt.Errorf("delete existing nftables table %q in %s: %w", namespaceFirewallTableName, cfg.Name, err)
+	for _, table := range tables {
+		if table.Name == name {
+			return table, nil
 		}
 	}
+	return nil, nil
+}
 
-	table := conn.AddTable(&nftables.Table{
+func namespaceFirewallTableSpec() *nftables.Table {
+	return &nftables.Table{
 		Family: nftables.TableFamilyINet,
 		Name:   namespaceFirewallTableName,
-	})
+	}
+}
+
+func namespaceFirewallInputChainSpec(table *nftables.Table) *nftables.Chain {
 	policyDrop := nftables.ChainPolicyDrop
-	input := conn.AddChain(&nftables.Chain{
+	return &nftables.Chain{
 		Name:     namespaceFirewallInputName,
 		Table:    table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookInput,
 		Priority: nftables.ChainPriorityFilter,
 		Policy:   &policyDrop,
-	})
+	}
+}
 
+func isNamespaceFirewallInputChain(chain *nftables.Chain) bool {
+	if chain == nil || chain.Name != namespaceFirewallInputName || chain.Type != nftables.ChainTypeFilter || chain.Device != "" {
+		return false
+	}
+	if chain.Hooknum == nil || *chain.Hooknum != *nftables.ChainHookInput {
+		return false
+	}
+	if chain.Priority == nil || *chain.Priority != *nftables.ChainPriorityFilter {
+		return false
+	}
+	if chain.Policy == nil || *chain.Policy != nftables.ChainPolicyDrop {
+		return false
+	}
+	return true
+}
+
+func discoverNamespaceFirewallState(conn namespaceFirewallConn) (namespaceFirewallState, error) {
+	table, err := lookupNFTablesTableByFamily(conn, nftables.TableFamilyINet, namespaceFirewallTableName)
+	if err != nil {
+		return namespaceFirewallState{}, err
+	}
+	if table == nil {
+		return namespaceFirewallState{}, nil
+	}
+
+	chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyINet)
+	if err != nil {
+		return namespaceFirewallState{}, err
+	}
+
+	var tableChains []*nftables.Chain
+	for _, chain := range chains {
+		if chain == nil || chain.Table == nil {
+			continue
+		}
+		if chain.Table.Family == nftables.TableFamilyINet && chain.Table.Name == table.Name {
+			chain.Table = table
+			tableChains = append(tableChains, chain)
+		}
+	}
+
+	if len(tableChains) != 1 {
+		return namespaceFirewallState{table: table, replaceTable: true}, nil
+	}
+	if !isNamespaceFirewallInputChain(tableChains[0]) {
+		return namespaceFirewallState{table: table, replaceTable: true}, nil
+	}
+
+	return namespaceFirewallState{table: table, inputChain: tableChains[0]}, nil
+}
+
+func queueNamespaceFirewallRules(conn namespaceFirewallConn, table *nftables.Table, input *nftables.Chain, cfg NSConfig) {
 	conn.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: input,
@@ -814,8 +886,48 @@ func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
 			},
 		})
 	}
+}
 
-	if err := conn.Flush(); err != nil {
+func configureNamespaceFirewallWithConn(conn namespaceFirewallConn, cfg NSConfig) error {
+	if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
+		return fmt.Errorf("invalid open port %d", cfg.OpenPort)
+	}
+
+	state, err := discoverNamespaceFirewallState(conn)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case state.table == nil:
+		table := conn.AddTable(namespaceFirewallTableSpec())
+		input := conn.AddChain(namespaceFirewallInputChainSpec(table))
+		queueNamespaceFirewallRules(conn, table, input, cfg)
+	case state.replaceTable:
+		conn.DelTable(state.table)
+		table := conn.AddTable(namespaceFirewallTableSpec())
+		input := conn.AddChain(namespaceFirewallInputChainSpec(table))
+		queueNamespaceFirewallRules(conn, table, input, cfg)
+	default:
+		conn.FlushChain(state.inputChain)
+		queueNamespaceFirewallRules(conn, state.table, state.inputChain, cfg)
+	}
+
+	return conn.Flush()
+}
+
+func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
+	cfg = normalizeNSConfig(cfg)
+
+	if cfg.OpenPort < 0 || cfg.OpenPort > 65535 {
+		return fmt.Errorf("invalid open port %d", cfg.OpenPort)
+	}
+
+	conn, err := newNamespaceFirewallConn(ns)
+	if err != nil {
+		return fmt.Errorf("open nftables connection in %s: %w", cfg.Name, err)
+	}
+	if err := configureNamespaceFirewallWithConn(conn, cfg); err != nil {
 		return fmt.Errorf("install nftables rules in %s: %w", cfg.Name, err)
 	}
 
