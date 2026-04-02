@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net"
@@ -177,6 +178,265 @@ func (s *namespaceHTTPService) Describe() (*DescribeResponse, error) {
 		HTTPAddr:  s.httpAddr,
 		Message:   "plugin ready",
 	}, nil
+}
+
+type hostNamespaceView struct {
+	Name           string `json:"name"`
+	VLANID         int    `json:"vlan_id"`
+	Interface      string `json:"interface"`
+	IPCIDR         string `json:"ip_cidr"`
+	MAC            string `json:"mac"`
+	Gateway        string `json:"gateway"`
+	ListenPort     int    `json:"listen_port"`
+	PluginHTTPAddr string `json:"plugin_http_addr"`
+	HTTPRunning    bool   `json:"http_running"`
+	Message        string `json:"message"`
+	Error          string `json:"error,omitempty"`
+}
+
+type hostDashboardData struct {
+	HostHTTPAddr string              `json:"host_http_addr"`
+	ParentNIC    string              `json:"parent_nic"`
+	RuntimeBase  string              `json:"runtime_base"`
+	Namespaces   []hostNamespaceView `json:"namespaces"`
+}
+
+type hostDashboardService struct {
+	addr        string
+	parentNIC   string
+	runtimeBase string
+	plugins     []*runningPlugin
+}
+
+var hostDashboardTemplate = template.Must(template.New("host-dashboard").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetForge Dashboard</title>
+<style>
+body {
+	font-family: "Segoe UI", sans-serif;
+	margin: 0;
+	padding: 2rem;
+	background: linear-gradient(180deg, #f6f4ee 0%, #eef2f6 100%);
+	color: #183153;
+}
+h1 {
+	margin-top: 0;
+}
+.meta {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+	gap: 1rem;
+	margin: 1.5rem 0;
+}
+.card, table {
+	background: rgba(255, 255, 255, 0.92);
+	border: 1px solid #d7e0ea;
+	border-radius: 16px;
+	box-shadow: 0 16px 40px rgba(24, 49, 83, 0.08);
+}
+.card {
+	padding: 1rem 1.2rem;
+}
+table {
+	width: 100%;
+	border-collapse: collapse;
+	overflow: hidden;
+}
+th, td {
+	padding: 0.85rem 1rem;
+	text-align: left;
+	vertical-align: top;
+	border-bottom: 1px solid #e3e9f0;
+}
+th {
+	background: #183153;
+	color: #fff;
+	font-weight: 600;
+}
+tr:last-child td {
+	border-bottom: 0;
+}
+.status-ok {
+	color: #0d6b3c;
+	font-weight: 600;
+}
+.status-bad {
+	color: #9a3412;
+	font-weight: 600;
+}
+code {
+	font-size: 0.95em;
+}
+</style>
+</head>
+<body>
+<h1>NetForge Dashboard</h1>
+<div class="meta">
+<div class="card"><strong>Host dashboard:</strong><br><code>{{.HostHTTPAddr}}</code></div>
+<div class="card"><strong>Parent NIC:</strong><br><code>{{.ParentNIC}}</code></div>
+<div class="card"><strong>Runtime base:</strong><br><code>{{.RuntimeBase}}</code></div>
+</div>
+<table>
+<thead>
+<tr>
+<th>Namespace</th>
+<th>VLAN</th>
+<th>Interface</th>
+<th>IP / Gateway</th>
+<th>MAC</th>
+<th>Plugin HTTP</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+{{range .Namespaces}}
+<tr>
+<td><code>{{.Name}}</code></td>
+<td>{{.VLANID}}</td>
+<td><code>{{.Interface}}</code></td>
+<td><code>{{.IPCIDR}}</code><br><code>{{if .Gateway}}{{.Gateway}}{{else}}none{{end}}</code></td>
+<td><code>{{.MAC}}</code></td>
+<td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
+<td>
+{{if .Error}}
+<span class="status-bad">{{.Error}}</span>
+{{else if .HTTPRunning}}
+<span class="status-ok">running</span><br>{{.Message}}
+{{else}}
+<span class="status-bad">stopped</span><br>{{.Message}}
+{{end}}
+</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+</body>
+</html>`))
+
+func (s *hostDashboardService) snapshot() hostDashboardData {
+	namespaces := make([]hostNamespaceView, 0, len(s.plugins))
+	for _, plugin := range s.plugins {
+		view := hostNamespaceView{
+			Name:       plugin.cfg.Name,
+			VLANID:     plugin.cfg.VLANID,
+			Interface:  plugin.cfg.IfName,
+			IPCIDR:     plugin.cfg.IPCIDR,
+			MAC:        plugin.cfg.MAC,
+			Gateway:    plugin.cfg.Gateway,
+			ListenPort: plugin.cfg.ListenPort,
+		}
+
+		if plugin.rpc == nil {
+			view.Error = "plugin rpc unavailable"
+			namespaces = append(namespaces, view)
+			continue
+		}
+
+		desc, descErr := plugin.rpc.Describe()
+		if descErr != nil {
+			view.Error = fmt.Sprintf("describe failed: %v", descErr)
+			namespaces = append(namespaces, view)
+			continue
+		}
+		view.Message = desc.Message
+		if desc.HTTPAddr != "" {
+			view.PluginHTTPAddr = desc.HTTPAddr
+		}
+
+		status, statusErr := plugin.rpc.Status()
+		if statusErr != nil {
+			view.Error = fmt.Sprintf("status failed: %v", statusErr)
+			namespaces = append(namespaces, view)
+			continue
+		}
+		if status.Interface != "" {
+			view.Interface = status.Interface
+		}
+		if status.IPCIDR != "" {
+			view.IPCIDR = status.IPCIDR
+		}
+		if status.MAC != "" {
+			view.MAC = status.MAC
+		}
+		if status.Gateway != "" {
+			view.Gateway = status.Gateway
+		}
+		if status.HTTPAddr != "" {
+			view.PluginHTTPAddr = status.HTTPAddr
+		}
+		view.HTTPRunning = status.HTTPRunning
+		namespaces = append(namespaces, view)
+	}
+
+	return hostDashboardData{
+		HostHTTPAddr: s.addr,
+		ParentNIC:    s.parentNIC,
+		RuntimeBase:  s.runtimeBase,
+		Namespaces:   namespaces,
+	}
+}
+
+func (s *hostDashboardService) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/api/namespaces", s.handleNamespacesAPI)
+	return mux
+}
+
+func (s *hostDashboardService) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := hostDashboardTemplate.Execute(w, s.snapshot()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func (s *hostDashboardService) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (s *hostDashboardService) handleNamespacesAPI(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(s.snapshot()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func startHostDashboard(addr, parentNIC, runtimeBase string, plugins []*runningPlugin) (*http.Server, string, error) {
+	service := &hostDashboardService{
+		addr:        addr,
+		parentNIC:   parentNIC,
+		runtimeBase: runtimeBase,
+		plugins:     plugins,
+	}
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, "", err
+	}
+
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           service.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		err := server.Serve(listener)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("host dashboard error: %v", err)
+		}
+	}()
+
+	return server, listener.Addr().String(), nil
 }
 
 func (s *namespaceHTTPService) StartHTTP(port int) (*StartHTTPResponse, error) {
@@ -749,7 +1009,7 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 	return &runningPlugin{cfg: cfg, client: client, rpc: svc}, nil
 }
 
-func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase string, configs []NSConfig) error {
+func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAddr string, configs []NSConfig) error {
 	plugins := make([]*runningPlugin, 0, len(configs))
 	defer func() {
 		for _, p := range plugins {
@@ -781,8 +1041,17 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase string, con
 		log.Printf("namespace=%s message=%q http=%s running=%v", desc.Namespace, desc.Message, status.HTTPAddr, status.HTTPRunning)
 	}
 
+	server, actualAddr, err := startHostDashboard(hostHTTPAddr, parentNIC, runtimeBase, plugins)
+	if err != nil {
+		return fmt.Errorf("start host dashboard on %s: %w", hostHTTPAddr, err)
+	}
+	log.Printf("host dashboard listening on http://%s", actualAddr)
+
 	<-ctx.Done()
-	return nil
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return server.Shutdown(shutdownCtx)
 }
 
 func runPluginMode() error {
@@ -817,6 +1086,7 @@ func runMain() error {
 
 	parentNIC := envDefault("PARENT_NIC", "enp0s31f6")
 	runtimeBase := envDefault("PLUGIN_RUNTIME_BASE", filepath.Join(os.TempDir(), "netforge"))
+	hostHTTPAddr := envDefault("HOST_HTTP_ADDR", "127.0.0.1:8090")
 
 	configs, err := loadConfigs(parentNIC)
 	if err != nil {
@@ -826,7 +1096,7 @@ func runMain() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	return runHost(ctx, parentNIC, selfBinary, runtimeBase, configs)
+	return runHost(ctx, parentNIC, selfBinary, runtimeBase, hostHTTPAddr, configs)
 }
 
 func main() {

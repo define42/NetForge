@@ -4,9 +4,13 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -19,6 +23,41 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
+
+type stubNamespaceService struct {
+	describe    *DescribeResponse
+	describeErr error
+	status      *StatusResponse
+	statusErr   error
+}
+
+func (s *stubNamespaceService) Describe() (*DescribeResponse, error) {
+	if s.describeErr != nil {
+		return nil, s.describeErr
+	}
+	if s.describe == nil {
+		return &DescribeResponse{}, nil
+	}
+	return s.describe, nil
+}
+
+func (s *stubNamespaceService) StartHTTP(port int) (*StartHTTPResponse, error) {
+	return &StartHTTPResponse{HTTPAddr: fmt.Sprintf(":%d", port)}, nil
+}
+
+func (s *stubNamespaceService) StopHTTP() error {
+	return nil
+}
+
+func (s *stubNamespaceService) Status() (*StatusResponse, error) {
+	if s.statusErr != nil {
+		return nil, s.statusErr
+	}
+	if s.status == nil {
+		return &StatusResponse{}, nil
+	}
+	return s.status, nil
+}
 
 func TestPluginConfigJSONRoundTrip(t *testing.T) {
 	cfg := NSConfig{
@@ -121,6 +160,103 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	if status.HTTPRunning {
 		t.Fatal("expected HTTPRunning=false after stop")
 	}
+}
+
+func TestHostDashboardServiceRoutes(t *testing.T) {
+	service := &hostDashboardService{
+		addr:        "127.0.0.1:8090",
+		parentNIC:   "eth0",
+		runtimeBase: "/tmp/netforge",
+		plugins: []*runningPlugin{
+			{
+				cfg: NSConfig{
+					Name:       "ns1",
+					VLANID:     100,
+					IfName:     "eth0.100",
+					IPCIDR:     "10.10.100.2/24",
+					MAC:        "02:00:00:00:10:02",
+					Gateway:    "10.10.100.1",
+					ListenPort: 18080,
+				},
+				rpc: &stubNamespaceService{
+					describe: &DescribeResponse{
+						Namespace: "ns1",
+						HTTPAddr:  ":18080",
+						Message:   "plugin ready",
+					},
+					status: &StatusResponse{
+						Namespace:   "ns1",
+						Interface:   "eth0.100",
+						IPCIDR:      "10.10.100.2/24",
+						MAC:         "02:00:00:00:10:02",
+						Gateway:     "10.10.100.1",
+						HTTPAddr:    ":18080",
+						HTTPRunning: true,
+					},
+				},
+			},
+			{
+				cfg: NSConfig{
+					Name:       "ns2",
+					VLANID:     200,
+					IfName:     "eth0.200",
+					IPCIDR:     "10.20.0.2/24",
+					MAC:        "02:00:00:00:20:02",
+					Gateway:    "",
+					ListenPort: 18081,
+				},
+				rpc: &stubNamespaceService{
+					describeErr: errors.New("plugin down"),
+				},
+			},
+		},
+	}
+
+	t.Run("html", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "ns2", "plugin down"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("dashboard body did not contain %q: %s", want, body)
+			}
+		}
+	})
+
+	t.Run("api", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/namespaces", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+
+		var payload hostDashboardData
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("json unmarshal failed: %v", err)
+		}
+		if payload.ParentNIC != "eth0" {
+			t.Fatalf("parent nic mismatch: got %q want %q", payload.ParentNIC, "eth0")
+		}
+		if len(payload.Namespaces) != 2 {
+			t.Fatalf("namespace count mismatch: got %d want %d", len(payload.Namespaces), 2)
+		}
+		if payload.Namespaces[0].Name != "ns1" || !payload.Namespaces[0].HTTPRunning {
+			t.Fatalf("unexpected first namespace payload: %+v", payload.Namespaces[0])
+		}
+		if payload.Namespaces[1].Error == "" {
+			t.Fatalf("expected second namespace error, got %+v", payload.Namespaces[1])
+		}
+	})
 }
 
 func requireIntegration(t *testing.T) {
