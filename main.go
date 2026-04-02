@@ -815,8 +815,8 @@ func runMain() error {
 		return err
 	}
 
-	parentNIC := envDefault("PARENT_NIC", "eth0")
-	runtimeBase := envDefault("PLUGIN_RUNTIME_BASE", "./netforge")
+	parentNIC := envDefault("PARENT_NIC", "enp0s31f6")
+	runtimeBase := envDefault("PLUGIN_RUNTIME_BASE", filepath.Join(os.TempDir(), "netforge"))
 
 	configs, err := loadConfigs(parentNIC)
 	if err != nil {
