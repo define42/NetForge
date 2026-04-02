@@ -22,9 +22,10 @@ const (
 	pluginSandboxUID = 65534
 	pluginSandboxGID = 65534
 
-	pluginSandboxSocketDir = "/run/go-plugin"
-	pluginSandboxProcDir   = "/proc"
-	pluginSandboxTmpDir    = "/tmp"
+	pluginSandboxSocketDir  = "/run/go-plugin"
+	pluginSandboxOldRootDir = "/.old-root"
+	pluginSandboxProcDir    = "/proc"
+	pluginSandboxTmpDir     = "/tmp"
 
 	envPluginSandboxRoot          = "NS_PLUGIN_SANDBOX_ROOT"
 	envPluginSandboxHostSocketDir = "NS_PLUGIN_SANDBOX_HOST_SOCKET_DIR"
@@ -47,11 +48,13 @@ var pluginSandboxReadonlyBindMounts = []string{
 
 var (
 	pluginSandboxMount     = unix.Mount
-	pluginSandboxChroot    = unix.Chroot
+	pluginSandboxPivotRoot = unix.PivotRoot
+	pluginSandboxUnmount   = unix.Unmount
 	pluginSandboxExec      = unix.Exec
 	pluginSandboxChdir     = os.Chdir
 	pluginSandboxChown     = os.Chown
 	pluginSandboxOpenFile  = os.OpenFile
+	pluginSandboxRemove    = os.Remove
 	pluginSandboxPrctl     = unix.Prctl
 	pluginSandboxSetresgid = unix.Setresgid
 	pluginSandboxSetresuid = unix.Setresuid
@@ -317,14 +320,35 @@ func (s pluginSandboxSpec) prepareFilesystem() error {
 		return fmt.Errorf("mount tmpfs in sandbox: %w", err)
 	}
 
-	if err := sandboxFailpoint("chroot"); err != nil {
+	if err := pluginSandboxMount(s.rootDir, s.rootDir, "", uintptr(unix.MS_BIND|unix.MS_REC), ""); err != nil {
+		return fmt.Errorf("bind sandbox root %q onto itself: %w", s.rootDir, err)
+	}
+
+	pivotOldRoot := s.rootPath(pluginSandboxOldRootDir)
+	if err := os.MkdirAll(pivotOldRoot, 0o755); err != nil {
+		return fmt.Errorf("create sandbox old root dir %q: %w", pivotOldRoot, err)
+	}
+
+	if err := sandboxFailpoint("pivot-root"); err != nil {
 		return err
 	}
-	if err := pluginSandboxChroot(s.rootDir); err != nil {
-		return fmt.Errorf("chroot sandbox root %q: %w", s.rootDir, err)
+	if err := pluginSandboxPivotRoot(s.rootDir, pivotOldRoot); err != nil {
+		return fmt.Errorf("pivot_root sandbox root %q: %w", s.rootDir, err)
 	}
 	if err := pluginSandboxChdir("/"); err != nil {
 		return fmt.Errorf("chdir sandbox root: %w", err)
+	}
+	if err := sandboxFailpoint("detach-old-root"); err != nil {
+		return err
+	}
+	if err := pluginSandboxUnmount(pluginSandboxOldRootDir, unix.MNT_DETACH); err != nil {
+		return fmt.Errorf("detach sandbox old root %q: %w", pluginSandboxOldRootDir, err)
+	}
+	if err := sandboxFailpoint("remove-old-root"); err != nil {
+		return err
+	}
+	if err := pluginSandboxRemove(pluginSandboxOldRootDir); err != nil {
+		return fmt.Errorf("remove sandbox old root dir %q: %w", pluginSandboxOldRootDir, err)
 	}
 
 	return nil

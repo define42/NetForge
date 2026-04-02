@@ -24,11 +24,13 @@ func resetSandboxTestHooks(t *testing.T) {
 
 	readonlyBindMounts := append([]string(nil), pluginSandboxReadonlyBindMounts...)
 	mount := pluginSandboxMount
-	chroot := pluginSandboxChroot
+	pivotRoot := pluginSandboxPivotRoot
+	unmount := pluginSandboxUnmount
 	execFn := pluginSandboxExec
 	chdir := pluginSandboxChdir
 	chown := pluginSandboxChown
 	openFile := pluginSandboxOpenFile
+	remove := pluginSandboxRemove
 	prctl := pluginSandboxPrctl
 	setresgid := pluginSandboxSetresgid
 	setresuid := pluginSandboxSetresuid
@@ -44,11 +46,13 @@ func resetSandboxTestHooks(t *testing.T) {
 	t.Cleanup(func() {
 		pluginSandboxReadonlyBindMounts = readonlyBindMounts
 		pluginSandboxMount = mount
-		pluginSandboxChroot = chroot
+		pluginSandboxPivotRoot = pivotRoot
+		pluginSandboxUnmount = unmount
 		pluginSandboxExec = execFn
 		pluginSandboxChdir = chdir
 		pluginSandboxChown = chown
 		pluginSandboxOpenFile = openFile
+		pluginSandboxRemove = remove
 		pluginSandboxPrctl = prctl
 		pluginSandboxSetresgid = setresgid
 		pluginSandboxSetresuid = setresuid
@@ -339,14 +343,28 @@ func TestPluginSandboxPrepareFilesystem(t *testing.T) {
 		return nil
 	}
 	pluginSandboxChown = func(string, int, int) error { return nil }
-	var chrootPath string
-	pluginSandboxChroot = func(path string) error {
-		chrootPath = path
+	var pivotRootNew string
+	var pivotRootOld string
+	pluginSandboxPivotRoot = func(newRoot, putOld string) error {
+		pivotRootNew = newRoot
+		pivotRootOld = putOld
 		return nil
 	}
 	var chdirPath string
 	pluginSandboxChdir = func(path string) error {
 		chdirPath = path
+		return nil
+	}
+	var unmountTarget string
+	var unmountFlags int
+	pluginSandboxUnmount = func(target string, flags int) error {
+		unmountTarget = target
+		unmountFlags = flags
+		return nil
+	}
+	var removePath string
+	pluginSandboxRemove = func(path string) error {
+		removePath = path
 		return nil
 	}
 
@@ -371,11 +389,20 @@ func TestPluginSandboxPrepareFilesystem(t *testing.T) {
 	} else if info.Mode().Perm() != 0o777 {
 		t.Fatalf("unexpected sandbox tmp perms: got %#o want %#o", info.Mode().Perm(), os.FileMode(0o777))
 	}
-	if chrootPath != spec.rootDir {
-		t.Fatalf("unexpected chroot path: got %q want %q", chrootPath, spec.rootDir)
+	if pivotRootNew != spec.rootDir {
+		t.Fatalf("unexpected pivot_root new root: got %q want %q", pivotRootNew, spec.rootDir)
+	}
+	if pivotRootOld != spec.rootPath(pluginSandboxOldRootDir) {
+		t.Fatalf("unexpected pivot_root old root: got %q want %q", pivotRootOld, spec.rootPath(pluginSandboxOldRootDir))
 	}
 	if chdirPath != "/" {
 		t.Fatalf("unexpected chdir path: got %q want %q", chdirPath, "/")
+	}
+	if unmountTarget != pluginSandboxOldRootDir || unmountFlags != unix.MNT_DETACH {
+		t.Fatalf("unexpected unmount call: got %q flags=%d", unmountTarget, unmountFlags)
+	}
+	if removePath != pluginSandboxOldRootDir {
+		t.Fatalf("unexpected remove path: got %q want %q", removePath, pluginSandboxOldRootDir)
 	}
 
 	wantTargets := []string{
@@ -383,6 +410,7 @@ func TestPluginSandboxPrepareFilesystem(t *testing.T) {
 		fmt.Sprintf("%s|%s||%d|", socketDir, spec.rootPath(spec.pluginSocketDir), uintptr(unix.MS_BIND)),
 		fmt.Sprintf("proc|%s|proc|%d|", spec.rootPath(pluginSandboxProcDir), uintptr(unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC)),
 		fmt.Sprintf("tmpfs|%s|tmpfs|%d|mode=1777,size=16777216", spec.rootPath(pluginSandboxTmpDir), uintptr(unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC)),
+		fmt.Sprintf("%s|%s||%d|", spec.rootDir, spec.rootDir, uintptr(unix.MS_BIND|unix.MS_REC)),
 	}
 	for _, want := range wantTargets {
 		if !slices.Contains(mounts, want) {
@@ -529,8 +557,10 @@ func TestPluginSandboxBootstrapAndExec(t *testing.T) {
 	pluginSandboxReadonlyBindMounts = nil
 	pluginSandboxMount = func(string, string, string, uintptr, string) error { return nil }
 	pluginSandboxChown = func(string, int, int) error { return nil }
-	pluginSandboxChroot = func(string) error { return nil }
+	pluginSandboxPivotRoot = func(string, string) error { return nil }
 	pluginSandboxChdir = func(string) error { return nil }
+	pluginSandboxUnmount = func(string, int) error { return nil }
+	pluginSandboxRemove = func(string) error { return nil }
 	pluginSandboxClearAmbientCapabilities = func() error { return nil }
 	pluginSandboxDropCapabilityBoundingSet = func() error { return nil }
 	pluginSandboxPrctl = func(int, uintptr, uintptr, uintptr, uintptr) error { return nil }
@@ -645,7 +675,7 @@ func TestSandboxHelperProcess(t *testing.T) {
 	switch mode {
 	case "ensure-bootstrap-fail-mount-private":
 		err = ensurePluginSandbox()
-	case "prepare-filesystem-fail-chroot":
+	case "prepare-filesystem-fail-pivot-root":
 		err = unix.Unshare(unix.CLONE_NEWNS)
 		if err == nil {
 			err = spec.prepareFilesystem()
@@ -715,7 +745,7 @@ func TestSandboxHelperSubprocesses(t *testing.T) {
 	})
 
 	t.Run("prepare filesystem through bind mounts", func(t *testing.T) {
-		runHelper(t, "prepare-filesystem-fail-chroot", "chroot", "sandbox failpoint at chroot")
+		runHelper(t, "prepare-filesystem-fail-pivot-root", "pivot-root", "sandbox failpoint at pivot-root")
 
 		socketTarget := filepath.Join(root, "run", "go-plugin")
 		if _, err := os.Stat(socketTarget); err != nil {
@@ -745,7 +775,7 @@ func TestStartNamespacePluginFailsClosedOnSandboxBootstrapError(t *testing.T) {
 	requireIntegration(t)
 
 	cfg, _, bin := setupPluginSandboxFixture(t, "210")
-	for _, step := range []string{"bind-socket", "mount-proc", "chroot", "setresgid", "setresuid", "cap-clear", "seccomp"} {
+	for _, step := range []string{"bind-socket", "mount-proc", "pivot-root", "detach-old-root", "remove-old-root", "setresgid", "setresuid", "cap-clear", "seccomp"} {
 		t.Run(step, func(t *testing.T) {
 			t.Setenv(envPluginSandboxFailStep, step)
 
@@ -775,9 +805,24 @@ func assertPluginSandboxed(t *testing.T, proc *runningPlugin) {
 		}
 	}
 
-	rootTarget := mustReadlink(t, fmt.Sprintf("/proc/%d/root", proc.pid))
-	if filepath.Clean(rootTarget) != filepath.Clean(proc.sandbox.rootDir) {
-		t.Fatalf("sandbox root mismatch: got %q want %q", rootTarget, proc.sandbox.rootDir)
+	rootInfo, err := os.Stat(fmt.Sprintf("/proc/%d/root", proc.pid))
+	if err != nil {
+		t.Fatalf("stat proc root failed: %v", err)
+	}
+	sandboxInfo, err := os.Stat(proc.sandbox.rootDir)
+	if err != nil {
+		t.Fatalf("stat sandbox root failed: %v", err)
+	}
+	rootStat, ok := rootInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("unexpected proc root stat type: %T", rootInfo.Sys())
+	}
+	sandboxStat, ok := sandboxInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("unexpected sandbox root stat type: %T", sandboxInfo.Sys())
+	}
+	if rootStat.Dev != sandboxStat.Dev || rootStat.Ino != sandboxStat.Ino {
+		t.Fatalf("sandbox root mismatch: proc dev/inode=%d/%d sandbox dev/inode=%d/%d", rootStat.Dev, rootStat.Ino, sandboxStat.Dev, sandboxStat.Ino)
 	}
 
 	status := readProcStatus(t, proc.pid)
