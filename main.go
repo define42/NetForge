@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -212,10 +215,17 @@ type hostNamespaceView struct {
 }
 
 type hostDashboardData struct {
-	HostHTTPAddr string              `json:"host_http_addr"`
-	ParentNIC    string              `json:"parent_nic"`
-	RuntimeBase  string              `json:"runtime_base"`
-	Namespaces   []hostNamespaceView `json:"namespaces"`
+	HostHTTPAddr          string              `json:"host_http_addr"`
+	ParentNIC             string              `json:"parent_nic"`
+	RuntimeBase           string              `json:"runtime_base"`
+	Namespaces            []hostNamespaceView `json:"namespaces"`
+	SelectedPingNamespace string              `json:"selected_ping_namespace,omitempty"`
+	PingTargetIP          string              `json:"ping_target_ip,omitempty"`
+	PingResult            *hostPingResultView `json:"ping_result,omitempty"`
+	SelectedTCPNamespace  string              `json:"selected_tcp_namespace,omitempty"`
+	TCPTargetIP           string              `json:"tcp_target_ip,omitempty"`
+	TCPTargetPort         string              `json:"tcp_target_port,omitempty"`
+	TCPCheckResult        *hostTCPResultView  `json:"tcp_check_result,omitempty"`
 }
 
 type hostNICStatisticsView struct {
@@ -234,13 +244,32 @@ type hostARPEntryView struct {
 	MAC string `json:"mac"`
 }
 
+type hostPingResultView struct {
+	Namespace string `json:"namespace"`
+	TargetIP  string `json:"target_ip"`
+	Success   bool   `json:"success"`
+	Output    string `json:"output,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type hostTCPResultView struct {
+	Namespace string `json:"namespace"`
+	TargetIP  string `json:"target_ip"`
+	Port      int    `json:"port"`
+	Success   bool   `json:"success"`
+	Output    string `json:"output,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 type hostDashboardService struct {
-	addr        string
-	parentNIC   string
-	runtimeBase string
-	plugins     []*runningPlugin
-	statsLookup func(namespaceName, ifName string) (hostNICStatisticsView, error)
-	arpLookup   func(namespaceName, ifName string) ([]hostARPEntryView, error)
+	addr         string
+	parentNIC    string
+	runtimeBase  string
+	plugins      []*runningPlugin
+	statsLookup  func(namespaceName, ifName string) (hostNICStatisticsView, error)
+	arpLookup    func(namespaceName, ifName string) ([]hostARPEntryView, error)
+	pingFunc     func(namespaceName, targetIP string) (string, error)
+	tcpCheckFunc func(namespaceName, targetIP string, port int) (string, error)
 }
 
 const (
@@ -310,6 +339,60 @@ tr:last-child td {
 code {
 	font-size: 0.95em;
 }
+form {
+	margin: 0;
+}
+.ping-card {
+	margin-bottom: 1.5rem;
+}
+.probe-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+	gap: 1rem;
+}
+.probe-pane h2 {
+	margin: 0 0 0.85rem;
+	font-size: 1.1rem;
+}
+.ping-form {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+	gap: 0.85rem;
+	align-items: end;
+}
+.ping-form label {
+	display: block;
+	font-weight: 600;
+}
+.ping-form input,
+.ping-form select,
+.ping-form button {
+	width: 100%;
+	box-sizing: border-box;
+	margin-top: 0.35rem;
+	padding: 0.7rem 0.8rem;
+	border-radius: 10px;
+	border: 1px solid #c8d3de;
+	font: inherit;
+}
+.ping-form button {
+	background: #183153;
+	color: #fff;
+	cursor: pointer;
+	font-weight: 600;
+}
+.ping-form button:hover {
+	background: #24456e;
+}
+pre {
+	margin: 0.85rem 0 0;
+	padding: 0.9rem 1rem;
+	background: #0f172a;
+	color: #e2e8f0;
+	border-radius: 12px;
+	overflow-x: auto;
+	white-space: pre-wrap;
+}
 </style>
 </head>
 <body>
@@ -318,6 +401,71 @@ code {
 <div class="card"><strong>Host dashboard:</strong><br><code>{{.HostHTTPAddr}}</code></div>
 <div class="card"><strong>Parent NIC:</strong><br><code>{{.ParentNIC}}</code></div>
 <div class="card"><strong>Runtime base:</strong><br><code>{{.RuntimeBase}}</code></div>
+</div>
+<div class="card ping-card">
+<div class="probe-grid">
+<div class="probe-pane">
+<h2>Ping Target</h2>
+<form class="ping-form" method="post" action="/ping">
+<label>Namespace
+<select name="namespace" required>
+<option value="">Select namespace</option>
+{{range .Namespaces}}
+<option value="{{.Name}}" {{if eq $.SelectedPingNamespace .Name}}selected{{end}}>{{.Name}}</option>
+{{end}}
+</select>
+</label>
+<label>Target IP
+<input type="text" name="target_ip" placeholder="192.168.1.1" value="{{.PingTargetIP}}" required>
+</label>
+<div>
+<button type="submit">Ping From Namespace</button>
+</div>
+</form>
+{{if .PingResult}}
+<div style="margin-top: 1rem;">
+{{if .PingResult.Success}}
+<div class="status-ok">Ping succeeded: <code>{{.PingResult.Namespace}}</code> -> <code>{{.PingResult.TargetIP}}</code></div>
+{{else}}
+<div class="status-bad">Ping failed: <code>{{.PingResult.Namespace}}</code> -> <code>{{.PingResult.TargetIP}}</code>{{if .PingResult.Error}}<br>{{.PingResult.Error}}{{end}}</div>
+{{end}}
+{{if .PingResult.Output}}<pre>{{.PingResult.Output}}</pre>{{end}}
+</div>
+{{end}}
+</div>
+<div class="probe-pane">
+<h2>TCP Port Check</h2>
+<form class="ping-form" method="post" action="/tcp-check">
+<label>Namespace
+<select name="namespace" required>
+<option value="">Select namespace</option>
+{{range .Namespaces}}
+<option value="{{.Name}}" {{if eq $.SelectedTCPNamespace .Name}}selected{{end}}>{{.Name}}</option>
+{{end}}
+</select>
+</label>
+<label>Target IP
+<input type="text" name="target_ip" placeholder="192.168.1.1" value="{{.TCPTargetIP}}" required>
+</label>
+<label>TCP Port
+<input type="number" name="port" min="1" max="65535" placeholder="80" value="{{.TCPTargetPort}}" required>
+</label>
+<div>
+<button type="submit">Test TCP Port</button>
+</div>
+</form>
+{{if .TCPCheckResult}}
+<div style="margin-top: 1rem;">
+{{if .TCPCheckResult.Success}}
+<div class="status-ok">TCP port is open: <code>{{.TCPCheckResult.Namespace}}</code> -> <code>{{.TCPCheckResult.TargetIP}}:{{.TCPCheckResult.Port}}</code></div>
+{{else}}
+<div class="status-bad">TCP port check failed: <code>{{.TCPCheckResult.Namespace}}</code> -> <code>{{.TCPCheckResult.TargetIP}}:{{.TCPCheckResult.Port}}</code>{{if .TCPCheckResult.Error}}<br>{{.TCPCheckResult.Error}}{{end}}</div>
+{{end}}
+{{if .TCPCheckResult.Output}}<pre>{{.TCPCheckResult.Output}}</pre>{{end}}
+</div>
+{{end}}
+</div>
+</div>
 </div>
 <table>
 <thead>
@@ -668,6 +816,8 @@ func configureNamespaceFirewall(ns netns.NsHandle, cfg NSConfig) error {
 func (s *hostDashboardService) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/ping", s.handlePing)
+	mux.HandleFunc("/tcp-check", s.handleTCPCheck)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/namespaces", s.handleNamespacesAPI)
 	return mux
@@ -678,10 +828,104 @@ func (s *hostDashboardService) handleIndex(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
+	s.renderIndex(w, s.snapshot())
+}
+
+func (s *hostDashboardService) renderIndex(w http.ResponseWriter, data hostDashboardData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := hostDashboardTemplate.Execute(w, s.snapshot()); err != nil {
+	if err := hostDashboardTemplate.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func (s *hostDashboardService) handlePing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	namespaceName := strings.TrimSpace(r.FormValue("namespace"))
+	targetIP := strings.TrimSpace(r.FormValue("target_ip"))
+	result := &hostPingResultView{
+		Namespace: namespaceName,
+		TargetIP:  targetIP,
+	}
+
+	switch {
+	case namespaceName == "":
+		result.Error = "namespace is required"
+	case !s.hasNamespace(namespaceName):
+		result.Error = fmt.Sprintf("unknown namespace %q", namespaceName)
+	case net.ParseIP(targetIP) == nil:
+		result.Error = fmt.Sprintf("invalid IP address %q", targetIP)
+	default:
+		output, err := s.ping(namespaceName, targetIP)
+		result.Output = output
+		if err != nil {
+			result.Error = err.Error()
+		} else {
+			result.Success = true
+		}
+	}
+
+	data := s.snapshot()
+	data.SelectedPingNamespace = namespaceName
+	data.PingTargetIP = targetIP
+	data.PingResult = result
+	s.renderIndex(w, data)
+}
+
+func (s *hostDashboardService) handleTCPCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	namespaceName := strings.TrimSpace(r.FormValue("namespace"))
+	targetIP := strings.TrimSpace(r.FormValue("target_ip"))
+	portRaw := strings.TrimSpace(r.FormValue("port"))
+	result := &hostTCPResultView{
+		Namespace: namespaceName,
+		TargetIP:  targetIP,
+	}
+
+	switch {
+	case namespaceName == "":
+		result.Error = "namespace is required"
+	case !s.hasNamespace(namespaceName):
+		result.Error = fmt.Sprintf("unknown namespace %q", namespaceName)
+	case net.ParseIP(targetIP) == nil:
+		result.Error = fmt.Sprintf("invalid IP address %q", targetIP)
+	default:
+		port, err := strconv.Atoi(portRaw)
+		if err != nil || port < 1 || port > 65535 {
+			result.Error = fmt.Sprintf("invalid TCP port %q", portRaw)
+		} else {
+			result.Port = port
+			output, err := s.checkTCPPort(namespaceName, targetIP, port)
+			result.Output = output
+			if err != nil {
+				result.Error = err.Error()
+			} else {
+				result.Success = true
+			}
+		}
+	}
+
+	data := s.snapshot()
+	data.SelectedTCPNamespace = namespaceName
+	data.TCPTargetIP = targetIP
+	data.TCPTargetPort = portRaw
+	data.TCPCheckResult = result
+	s.renderIndex(w, data)
 }
 
 func (s *hostDashboardService) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -694,6 +938,127 @@ func (s *hostDashboardService) handleNamespacesAPI(w http.ResponseWriter, _ *htt
 	if err := json.NewEncoder(w).Encode(s.snapshot()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func (s *hostDashboardService) hasNamespace(namespaceName string) bool {
+	for _, plugin := range s.plugins {
+		if plugin != nil && plugin.cfg.Name == namespaceName {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *hostDashboardService) ping(namespaceName, targetIP string) (string, error) {
+	if s.pingFunc != nil {
+		return s.pingFunc(namespaceName, targetIP)
+	}
+	return pingNamespaceAddress(namespaceName, targetIP)
+}
+
+func (s *hostDashboardService) checkTCPPort(namespaceName, targetIP string, port int) (string, error) {
+	if s.tcpCheckFunc != nil {
+		return s.tcpCheckFunc(namespaceName, targetIP, port)
+	}
+	return checkNamespaceTCPPort(namespaceName, targetIP, port)
+}
+
+func pingNamespaceAddress(namespaceName, targetIP string) (string, error) {
+	ip := net.ParseIP(targetIP)
+	if ip == nil {
+		return "", fmt.Errorf("invalid IP address %q", targetIP)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	args := []string{"-n", "-c", "1", "-W", "2"}
+	if ip.To4() != nil {
+		args = append(args, "-4")
+	} else {
+		args = append(args, "-6")
+	}
+	args = append(args, targetIP)
+
+	cmd := exec.CommandContext(ctx, "ping", args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := startCmdInNamedNamespace(cmd, namespaceName); err != nil {
+		return "", fmt.Errorf("start ping in namespace %q: %w", namespaceName, err)
+	}
+
+	err := cmd.Wait()
+	output := strings.TrimSpace(stdout.String())
+	if stderr.Len() > 0 {
+		if output != "" {
+			output += "\n"
+		}
+		output += strings.TrimSpace(stderr.String())
+	}
+
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if output == "" {
+			output = "ping timed out"
+		}
+		return output, errors.New("ping timed out")
+	}
+	if err != nil {
+		if output == "" {
+			output = fmt.Sprintf("ping to %s from %s failed", targetIP, namespaceName)
+		}
+		return output, fmt.Errorf("ping %s from %s failed: %w", targetIP, namespaceName, err)
+	}
+	if output == "" {
+		output = fmt.Sprintf("ping to %s from %s succeeded", targetIP, namespaceName)
+	}
+	return output, nil
+}
+
+func checkNamespaceTCPPort(namespaceName, targetIP string, port int) (string, error) {
+	ip := net.ParseIP(targetIP)
+	if ip == nil {
+		return "", fmt.Errorf("invalid IP address %q", targetIP)
+	}
+	if port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid TCP port %d", port)
+	}
+
+	ns, err := netns.GetFromName(namespaceName)
+	if err != nil {
+		return "", fmt.Errorf("lookup namespace %q: %w", namespaceName, err)
+	}
+	defer ns.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	original, err := netns.Get()
+	if err != nil {
+		return "", fmt.Errorf("get current namespace: %w", err)
+	}
+	defer original.Close()
+
+	if err := netns.Set(ns); err != nil {
+		return "", fmt.Errorf("enter namespace %q: %w", namespaceName, err)
+	}
+	defer netns.Set(original)
+
+	network := "tcp4"
+	if ip.To4() == nil {
+		network = "tcp6"
+	}
+
+	addr := net.JoinHostPort(targetIP, strconv.Itoa(port))
+	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).Dial(network, addr)
+	if err != nil {
+		return fmt.Sprintf("tcp connect to %s failed", addr), fmt.Errorf("tcp connect to %s from %s failed: %w", addr, namespaceName, err)
+	}
+	_ = conn.Close()
+
+	return fmt.Sprintf("tcp connect to %s from %s succeeded", addr, namespaceName), nil
 }
 
 func startHostDashboard(addr, parentNIC, runtimeBase string, plugins []*runningPlugin) (*http.Server, string, error) {

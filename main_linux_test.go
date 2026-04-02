@@ -438,7 +438,24 @@ func TestNamespaceCmdRunnerHelpers(t *testing.T) {
 	}
 }
 
+func TestPingNamespaceAddressRejectsInvalidIP(t *testing.T) {
+	if _, err := pingNamespaceAddress("ns1", "not-an-ip"); err == nil {
+		t.Fatal("expected invalid ip error")
+	}
+}
+
+func TestCheckNamespaceTCPPortRejectsInvalidInput(t *testing.T) {
+	if _, err := checkNamespaceTCPPort("ns1", "not-an-ip", 80); err == nil {
+		t.Fatal("expected invalid ip error")
+	}
+	if _, err := checkNamespaceTCPPort("ns1", "192.0.2.1", 0); err == nil {
+		t.Fatal("expected invalid port error")
+	}
+}
+
 func TestHostDashboardServiceRoutes(t *testing.T) {
+	var pingCalls []string
+	var tcpCheckCalls []string
 	service := &hostDashboardService{
 		addr:        "127.0.0.1:8090",
 		parentNIC:   "eth0",
@@ -474,6 +491,20 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 			default:
 				return nil, fmt.Errorf("unexpected namespace %q", namespaceName)
 			}
+		},
+		pingFunc: func(namespaceName, targetIP string) (string, error) {
+			pingCalls = append(pingCalls, namespaceName+"->"+targetIP)
+			if namespaceName == "ns1" && targetIP == "10.10.100.1" {
+				return "PING 10.10.100.1: 1 packets transmitted, 1 received", nil
+			}
+			return "PING failed", fmt.Errorf("ping %s from %s failed", targetIP, namespaceName)
+		},
+		tcpCheckFunc: func(namespaceName, targetIP string, port int) (string, error) {
+			tcpCheckCalls = append(tcpCheckCalls, fmt.Sprintf("%s->%s:%d", namespaceName, targetIP, port))
+			if namespaceName == "ns1" && targetIP == "10.10.100.1" && port == 80 {
+				return "tcp connect to 10.10.100.1:80 from ns1 succeeded", nil
+			}
+			return "tcp connect failed", fmt.Errorf("tcp connect to %s:%d from %s failed", targetIP, port, namespaceName)
 		},
 		plugins: []*runningPlugin{
 			{
@@ -537,7 +568,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 
 		body := rec.Body.String()
-		for _, want := range []string{"NetForge Dashboard", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "10.10.100.1", "02:00:00:00:10:01", "10.10.100.3", "02:00:00:00:10:03", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "arp unavailable", "statistics unavailable", "plugin down"} {
+		for _, want := range []string{"NetForge Dashboard", "Ping From Namespace", "Test TCP Port", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "10.10.100.1", "02:00:00:00:10:01", "10.10.100.3", "02:00:00:00:10:03", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "arp unavailable", "statistics unavailable", "plugin down"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("dashboard body did not contain %q: %s", want, body)
 			}
@@ -593,6 +624,238 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 		if payload.Namespaces[1].StatisticsError == "" {
 			t.Fatalf("expected second namespace statistics error, got %+v", payload.Namespaces[1])
+		}
+	})
+
+	t.Run("ping success", func(t *testing.T) {
+		pingCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns1"},
+			"target_ip": {"10.10.100.1"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/ping", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(pingCalls) != 1 || pingCalls[0] != "ns1->10.10.100.1" {
+			t.Fatalf("unexpected ping calls: %+v", pingCalls)
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{"Ping succeeded", "ns1", "10.10.100.1", "1 packets transmitted, 1 received"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("ping body did not contain %q: %s", want, body)
+			}
+		}
+	})
+
+	t.Run("ping invalid ip", func(t *testing.T) {
+		pingCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns1"},
+			"target_ip": {"not-an-ip"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/ping", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(pingCalls) != 0 {
+			t.Fatalf("expected no ping calls for invalid ip, got %+v", pingCalls)
+		}
+		if !strings.Contains(rec.Body.String(), "invalid IP address") || !strings.Contains(rec.Body.String(), "not-an-ip") {
+			t.Fatalf("expected invalid ip error, got %s", rec.Body.String())
+		}
+	})
+
+	t.Run("ping unknown namespace", func(t *testing.T) {
+		pingCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns9"},
+			"target_ip": {"10.10.100.1"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/ping", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(pingCalls) != 0 {
+			t.Fatalf("expected no ping calls for unknown namespace, got %+v", pingCalls)
+		}
+		if !strings.Contains(rec.Body.String(), "unknown namespace") || !strings.Contains(rec.Body.String(), "ns9") {
+			t.Fatalf("expected unknown namespace error, got %s", rec.Body.String())
+		}
+	})
+
+	t.Run("ping failure", func(t *testing.T) {
+		pingCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns2"},
+			"target_ip": {"10.20.0.1"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/ping", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(pingCalls) != 1 || pingCalls[0] != "ns2->10.20.0.1" {
+			t.Fatalf("unexpected ping calls: %+v", pingCalls)
+		}
+		body := rec.Body.String()
+		for _, want := range []string{"Ping failed", "ns2", "10.20.0.1", "PING failed"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("ping failure body did not contain %q: %s", want, body)
+			}
+		}
+	})
+
+	t.Run("ping wrong method", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusMethodNotAllowed)
+		}
+	})
+
+	t.Run("tcp success", func(t *testing.T) {
+		tcpCheckCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns1"},
+			"target_ip": {"10.10.100.1"},
+			"port":      {"80"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/tcp-check", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(tcpCheckCalls) != 1 || tcpCheckCalls[0] != "ns1->10.10.100.1:80" {
+			t.Fatalf("unexpected tcp check calls: %+v", tcpCheckCalls)
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{"TCP port is open", "ns1", "10.10.100.1:80", "tcp connect to 10.10.100.1:80 from ns1 succeeded"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("tcp success body did not contain %q: %s", want, body)
+			}
+		}
+	})
+
+	t.Run("tcp invalid port", func(t *testing.T) {
+		tcpCheckCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns1"},
+			"target_ip": {"10.10.100.1"},
+			"port":      {"nope"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/tcp-check", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(tcpCheckCalls) != 0 {
+			t.Fatalf("expected no tcp check calls for invalid port, got %+v", tcpCheckCalls)
+		}
+		if !strings.Contains(rec.Body.String(), "invalid TCP port") || !strings.Contains(rec.Body.String(), "nope") {
+			t.Fatalf("expected invalid port error, got %s", rec.Body.String())
+		}
+	})
+
+	t.Run("tcp unknown namespace", func(t *testing.T) {
+		tcpCheckCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns9"},
+			"target_ip": {"10.10.100.1"},
+			"port":      {"80"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/tcp-check", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(tcpCheckCalls) != 0 {
+			t.Fatalf("expected no tcp check calls for unknown namespace, got %+v", tcpCheckCalls)
+		}
+		if !strings.Contains(rec.Body.String(), "unknown namespace") || !strings.Contains(rec.Body.String(), "ns9") {
+			t.Fatalf("expected unknown namespace error, got %s", rec.Body.String())
+		}
+	})
+
+	t.Run("tcp failure", func(t *testing.T) {
+		tcpCheckCalls = nil
+
+		form := url.Values{
+			"namespace": {"ns2"},
+			"target_ip": {"10.20.0.1"},
+			"port":      {"443"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/tcp-check", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+		if len(tcpCheckCalls) != 1 || tcpCheckCalls[0] != "ns2->10.20.0.1:443" {
+			t.Fatalf("unexpected tcp check calls: %+v", tcpCheckCalls)
+		}
+		body := rec.Body.String()
+		for _, want := range []string{"TCP port check failed", "ns2", "10.20.0.1:443", "tcp connect failed"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("tcp failure body did not contain %q: %s", want, body)
+			}
+		}
+	})
+
+	t.Run("tcp wrong method", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/tcp-check", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusMethodNotAllowed)
 		}
 	})
 }
