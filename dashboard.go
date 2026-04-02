@@ -817,12 +817,16 @@ func (s *hostDashboardService) handleNamespacesAPI(w http.ResponseWriter, r *htt
 }
 
 func (s *hostDashboardService) hasNamespace(namespaceName string) bool {
+	return s.pluginForNamespace(namespaceName) != nil
+}
+
+func (s *hostDashboardService) pluginForNamespace(namespaceName string) *runningPlugin {
 	for _, plugin := range s.plugins {
 		if plugin != nil && plugin.cfg.Name == namespaceName {
-			return true
+			return plugin
 		}
 	}
-	return false
+	return nil
 }
 
 func (s *hostDashboardService) ping(namespaceName, targetIP string) (string, error) {
@@ -836,7 +840,15 @@ func (s *hostDashboardService) checkTCPPort(namespaceName, targetIP string, port
 	if s.tcpCheckFunc != nil {
 		return s.tcpCheckFunc(namespaceName, targetIP, port)
 	}
-	return checkNamespaceTCPPort(namespaceName, targetIP, port)
+
+	plugin := s.pluginForNamespace(namespaceName)
+	if plugin == nil {
+		return "", fmt.Errorf("unknown namespace %q", namespaceName)
+	}
+	if plugin.rpc == nil {
+		return "", fmt.Errorf("plugin rpc for namespace %q is unavailable", namespaceName)
+	}
+	return plugin.rpc.CheckTCPPort(targetIP, port)
 }
 
 func withNamedNamespace(namespaceName string, fn func() error) error {
@@ -924,7 +936,7 @@ func pingNamespaceAddress(namespaceName, targetIP string) (string, error) {
 	return output, nil
 }
 
-func checkNamespaceTCPPort(namespaceName, targetIP string, port int) (string, error) {
+func checkCurrentNamespaceTCPPort(namespaceName, targetIP string, port int) (string, error) {
 	ip := net.ParseIP(targetIP)
 	if ip == nil {
 		return "", fmt.Errorf("invalid IP address %q", targetIP)
@@ -939,16 +951,11 @@ func checkNamespaceTCPPort(namespaceName, targetIP string, port int) (string, er
 	}
 
 	addr := net.JoinHostPort(targetIP, strconv.Itoa(port))
-	if err := runInNamedNamespace(namespaceName, func() error {
-		conn, err := (&net.Dialer{Timeout: 3 * time.Second}).Dial(network, addr)
-		if err != nil {
-			return err
-		}
-		_ = conn.Close()
-		return nil
-	}); err != nil {
+	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).Dial(network, addr)
+	if err != nil {
 		return fmt.Sprintf("tcp connect to %s failed", addr), fmt.Errorf("tcp connect to %s from %s failed: %w", addr, namespaceName, err)
 	}
+	_ = conn.Close()
 
 	return fmt.Sprintf("tcp connect to %s from %s succeeded", addr, namespaceName), nil
 }

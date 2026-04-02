@@ -32,13 +32,15 @@ import (
 )
 
 type stubNamespaceService struct {
-	describe    *DescribeResponse
-	describeErr error
-	start       *StartHTTPResponse
-	startErr    error
-	stopErr     error
-	status      *StatusResponse
-	statusErr   error
+	describe       *DescribeResponse
+	describeErr    error
+	start          *StartHTTPResponse
+	startErr       error
+	checkTCPOutput string
+	checkTCPErr    error
+	stopErr        error
+	status         *StatusResponse
+	statusErr      error
 }
 
 func (s *stubNamespaceService) Describe() (*DescribeResponse, error) {
@@ -59,6 +61,16 @@ func (s *stubNamespaceService) StartHTTP(port int) (*StartHTTPResponse, error) {
 		return s.start, nil
 	}
 	return &StartHTTPResponse{HTTPAddr: fmt.Sprintf(":%d", port)}, nil
+}
+
+func (s *stubNamespaceService) CheckTCPPort(targetIP string, port int) (string, error) {
+	if s.checkTCPErr != nil {
+		return s.checkTCPOutput, s.checkTCPErr
+	}
+	if s.checkTCPOutput != "" {
+		return s.checkTCPOutput, nil
+	}
+	return fmt.Sprintf("tcp connect to %s succeeded", net.JoinHostPort(targetIP, fmt.Sprintf("%d", port))), nil
 }
 
 func (s *stubNamespaceService) StopHTTP() error {
@@ -102,6 +114,10 @@ func (s *delayedNamespaceService) Describe() (*DescribeResponse, error) {
 
 func (s *delayedNamespaceService) StartHTTP(port int) (*StartHTTPResponse, error) {
 	return &StartHTTPResponse{HTTPAddr: fmt.Sprintf(":%d", port)}, nil
+}
+
+func (s *delayedNamespaceService) CheckTCPPort(targetIP string, port int) (string, error) {
+	return fmt.Sprintf("tcp connect to %s succeeded", net.JoinHostPort(targetIP, fmt.Sprintf("%d", port))), nil
 }
 
 func (s *delayedNamespaceService) StopHTTP() error {
@@ -329,7 +345,8 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 			HTTPAddr:  ":19090",
 			Message:   "plugin ready",
 		},
-		start: &StartHTTPResponse{HTTPAddr: ":19090"},
+		start:          &StartHTTPResponse{HTTPAddr: ":19090"},
+		checkTCPOutput: "tcp connect to 192.0.2.10:19090 from ns-rpc succeeded",
 		status: &StatusResponse{
 			Namespace:   "ns-rpc",
 			Interface:   "eth0.42",
@@ -367,6 +384,14 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 	}
 	if start.HTTPAddr != ":19090" {
 		t.Fatalf("unexpected start response: %+v", start)
+	}
+
+	var checkTCP string
+	if err := server.CheckTCPPort(CheckTCPPortRequest{TargetIP: "192.0.2.10", Port: 19090}, &checkTCP); err != nil {
+		t.Fatalf("CheckTCPPort failed: %v", err)
+	}
+	if checkTCP != "tcp connect to 192.0.2.10:19090 from ns-rpc succeeded" {
+		t.Fatalf("unexpected CheckTCPPort response: %q", checkTCP)
 	}
 
 	if err := server.StopHTTP(struct{}{}, &struct{}{}); err != nil {
@@ -455,6 +480,14 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "namespace=ns-test") {
 		t.Fatalf("unexpected body: %s", string(body))
+	}
+
+	checkTCPOutput, err := svc.CheckTCPPort("127.0.0.1", 18080)
+	if err != nil {
+		t.Fatalf("CheckTCPPort failed: %v", err)
+	}
+	if !strings.Contains(checkTCPOutput, "tcp connect to 127.0.0.1:18080 from ns-test succeeded") {
+		t.Fatalf("unexpected CheckTCPPort output: %q", checkTCPOutput)
 	}
 
 	if err := svc.StopHTTP(); err != nil {
@@ -692,12 +725,33 @@ func TestPingNamespaceAddressTimeoutReturnsError(t *testing.T) {
 	}
 }
 
-func TestCheckNamespaceTCPPortRejectsInvalidInput(t *testing.T) {
-	if _, err := checkNamespaceTCPPort("ns1", "not-an-ip", 80); err == nil {
+func TestCheckCurrentNamespaceTCPPortRejectsInvalidInput(t *testing.T) {
+	if _, err := checkCurrentNamespaceTCPPort("ns1", "not-an-ip", 80); err == nil {
 		t.Fatal("expected invalid ip error")
 	}
-	if _, err := checkNamespaceTCPPort("ns1", "192.0.2.1", 0); err == nil {
+	if _, err := checkCurrentNamespaceTCPPort("ns1", "192.0.2.1", 0); err == nil {
 		t.Fatal("expected invalid port error")
+	}
+}
+
+func TestHostDashboardServiceCheckTCPPortUsesPluginRPC(t *testing.T) {
+	service := &hostDashboardService{
+		plugins: []*runningPlugin{
+			{
+				cfg: NSConfig{Name: "ns1"},
+				rpc: &stubNamespaceService{
+					checkTCPOutput: "tcp connect to 10.10.100.1:443 from ns1 succeeded",
+				},
+			},
+		},
+	}
+
+	output, err := service.checkTCPPort("ns1", "10.10.100.1", 443)
+	if err != nil {
+		t.Fatalf("checkTCPPort failed: %v", err)
+	}
+	if output != "tcp connect to 10.10.100.1:443 from ns1 succeeded" {
+		t.Fatalf("unexpected output: %q", output)
 	}
 }
 
@@ -1828,6 +1882,14 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 	waitForHTTP(t, func() (string, int, error) {
 		return httpGetInNamespace(nsName, fmt.Sprintf("http://127.0.0.1:%d/healthz", cfg.ListenPort))
 	})
+
+	checkTCPOutput, err := proc.rpc.CheckTCPPort("127.0.0.1", cfg.ListenPort)
+	if err != nil {
+		t.Fatalf("CheckTCPPort failed: %v", err)
+	}
+	if !strings.Contains(checkTCPOutput, fmt.Sprintf("tcp connect to 127.0.0.1:%d from %s succeeded", cfg.ListenPort, nsName)) {
+		t.Fatalf("unexpected CheckTCPPort output: %q", checkTCPOutput)
+	}
 
 	body, code, err := httpGetInNamespace(nsName, fmt.Sprintf("http://127.0.0.1:%d/", cfg.ListenPort))
 	if err != nil {

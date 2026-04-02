@@ -42,6 +42,11 @@ type StartHTTPResponse struct {
 	HTTPAddr string
 }
 
+type CheckTCPPortRequest struct {
+	TargetIP string
+	Port     int
+}
+
 type StatusResponse struct {
 	Namespace   string
 	Interface   string
@@ -57,6 +62,7 @@ type StatusResponse struct {
 type NamespaceService interface {
 	Describe() (*DescribeResponse, error)
 	StartHTTP(port int) (*StartHTTPResponse, error)
+	CheckTCPPort(targetIP string, port int) (string, error)
 	StopHTTP() error
 	Status() (*StatusResponse, error)
 }
@@ -106,6 +112,15 @@ func (s *namespaceServiceRPCServer) StartHTTP(port int, resp *StartHTTPResponse)
 	return nil
 }
 
+func (s *namespaceServiceRPCServer) CheckTCPPort(req CheckTCPPortRequest, resp *string) error {
+	out, err := s.Impl.CheckTCPPort(req.TargetIP, req.Port)
+	if err != nil {
+		return err
+	}
+	*resp = out
+	return nil
+}
+
 func (s *namespaceServiceRPCServer) StopHTTP(_ struct{}, _ *struct{}) error {
 	return s.Impl.StopHTTP()
 }
@@ -133,6 +148,12 @@ func (c *namespaceServiceRPCClient) StartHTTP(port int) (*StartHTTPResponse, err
 	var out StartHTTPResponse
 	err := c.client.Call("Plugin.StartHTTP", port, &out)
 	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) CheckTCPPort(targetIP string, port int) (string, error) {
+	var out string
+	err := c.client.Call("Plugin.CheckTCPPort", CheckTCPPortRequest{TargetIP: targetIP, Port: port}, &out)
+	return out, err
 }
 
 func (c *namespaceServiceRPCClient) StopHTTP() error {

@@ -96,6 +96,10 @@ func (s *namespaceHTTPService) StartHTTP(port int) (*StartHTTPResponse, error) {
 	return &StartHTTPResponse{HTTPAddr: s.httpAddr}, nil
 }
 
+func (s *namespaceHTTPService) CheckTCPPort(targetIP string, port int) (string, error) {
+	return checkCurrentNamespaceTCPPort(s.cfg.Namespace, targetIP, port)
+}
+
 func (s *namespaceHTTPService) StopHTTP() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
