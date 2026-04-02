@@ -31,6 +31,7 @@ NetForge is destructive by design.
 - This includes namespaces NetForge did not create.
 - Manual changes inside a configured namespace are not preserved.
 - Namespace-local firewall changes are not preserved either; NetForge rewrites the managed firewall state.
+- The runtime base is security-sensitive. NetForge always uses `/var/lib/netforge`, and it must remain root-owned and `0700`.
 
 Do not run this on a host where unrelated named namespaces must survive.
 
@@ -77,16 +78,16 @@ sudo ./netforge
 The host process reads these environment variables:
 
 - `PARENT_NIC`: parent interface used to create VLAN subinterfaces. Default: `enp0s31f6`
-- `PLUGIN_RUNTIME_BASE`: runtime directory. Default: `/tmp/netforge`
 - `HOST_HTTP_ADDR`: host dashboard address. Default: `127.0.0.1:8090`
 - `NS_CONFIG_JSON`: JSON array of namespace configs. If unset, built-in demo defaults are used
+
+NetForge always uses `/var/lib/netforge` as its runtime base.
 
 Example:
 
 ```bash
 export PARENT_NIC=eth0
 export HOST_HTTP_ADDR=127.0.0.1:8090
-export PLUGIN_RUNTIME_BASE=/tmp/netforge
 export NS_CONFIG_JSON='[
   {
     "name": "ns1",

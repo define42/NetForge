@@ -354,7 +354,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 
 func TestStartHostDashboardAndRunHost(t *testing.T) {
 	t.Run("dashboard server", func(t *testing.T) {
-		server, addr, err := startHostDashboard("127.0.0.1:0", "eth0", "/tmp/netforge", nil)
+		server, addr, err := startHostDashboard("127.0.0.1:0", "eth0", "/var/lib/netforge", nil)
 		if err != nil {
 			t.Fatalf("startHostDashboard failed: %v", err)
 		}
@@ -503,7 +503,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 	service := &hostDashboardService{
 		addr:        "127.0.0.1:8090",
 		parentNIC:   "eth0",
-		runtimeBase: "/tmp/netforge",
+		runtimeBase: "/var/lib/netforge",
 		statsLookup: func(namespaceName, ifName string) (hostNICStatisticsView, error) {
 			switch namespaceName {
 			case "ns1":

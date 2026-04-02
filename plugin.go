@@ -388,8 +388,8 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 	cfg = normalizeNSConfig(cfg)
 
 	runtimeDir := filepath.Join(runtimeBase, cfg.Name)
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create runtime dir %q: %w", runtimeDir, err)
+	if err := ensurePrivateOwnedDir(runtimeDir); err != nil {
+		return nil, err
 	}
 
 	childBinary, err := stagePluginChildBinary(selfBinary, runtimeDir)

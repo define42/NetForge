@@ -35,15 +35,17 @@ Important constraints:
 The host process uses these environment variables:
 
 - `PARENT_NIC`: parent interface for VLAN subinterfaces, default `enp0s31f6`
-- `PLUGIN_RUNTIME_BASE`: runtime directory, default `/tmp/netforge`
 - `HOST_HTTP_ADDR`: host dashboard bind address, default `127.0.0.1:8090`
 - `NS_CONFIG_JSON`: full namespace configuration list; if unset, built-in defaults are used
+
+The runtime base is fixed at `/var/lib/netforge`; it is not user-configurable.
 
 Internal plugin/sandbox environment variables are implementation details and should not be turned into user-facing config unless that is an explicit feature change.
 
 ## Security Warnings
 
 - NetForge runs as root and performs destructive host network changes.
+- The runtime base directory is security-sensitive. NetForge always uses `/var/lib/netforge`, and it must remain root-owned with `0700` permissions.
 - On startup, NetForge currently assumes ownership of all named network namespaces visible under `/run/netns`.
 - Any named namespace on the host that is not represented in the active NetForge config will be removed, even if NetForge did not create it.
 - Any named namespace that is represented in the active NetForge config is also deleted and recreated from scratch on startup.

@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -23,6 +22,10 @@ func envDefault(key, fallback string) string {
 }
 
 func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAddr string, configs []NSConfig) (err error) {
+	if err := ensurePrivateOwnedDir(runtimeBase); err != nil {
+		return err
+	}
+
 	for i := range configs {
 		configs[i] = normalizeNSConfig(configs[i])
 	}
@@ -117,7 +120,6 @@ func runMain() error {
 	}
 
 	parentNIC := envDefault("PARENT_NIC", "enp0s31f6")
-	runtimeBase := envDefault("PLUGIN_RUNTIME_BASE", filepath.Join(os.TempDir(), "netforge"))
 	hostHTTPAddr := envDefault("HOST_HTTP_ADDR", "127.0.0.1:8090")
 
 	configs, err := loadConfigs(parentNIC)
@@ -128,7 +130,7 @@ func runMain() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	return runHost(ctx, parentNIC, selfBinary, runtimeBase, hostHTTPAddr, configs)
+	return runHost(ctx, parentNIC, selfBinary, defaultPluginRuntimeBase, hostHTTPAddr, configs)
 }
 
 func main() {
