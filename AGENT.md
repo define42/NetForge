@@ -11,6 +11,8 @@ NetForge is a Linux-only Go program that:
 - hardens that child with user/mount/pid namespaces, `pivot_root`, dropped capabilities, seccomp, and cgroup v2 placement
 - exposes a small host dashboard plus per-namespace HTTP servers
 
+NetForge should be treated as appliance software. It is expected to be the only application-level software on the server managing the network structure and named namespaces, and it enforces only the topology it owns.
+
 The whole project currently lives in `main.go` plus a few Linux-only support files:
 
 - `sandbox_linux.go`: plugin sandbox bootstrap and seccomp
@@ -46,8 +48,10 @@ Internal plugin/sandbox environment variables are implementation details and sho
 ## Security Warnings
 
 - NetForge runs as root and performs destructive host network changes.
+- NetForge assumes exclusive ownership of the host's named namespace topology and the VLAN-backed structure described by its config.
 - The runtime base directory is security-sensitive. NetForge always uses `/var/lib/netforge`, and it must remain root-owned with `0700` permissions.
 - On startup, NetForge currently assumes ownership of all named network namespaces visible under `/run/netns`.
+- NetForge does not accept unrelated named namespaces or parallel namespace-management software outside its control.
 - Any named namespace on the host that is not represented in the active NetForge config will be removed, even if NetForge did not create it.
 - Any named namespace that is represented in the active NetForge config is also deleted and recreated from scratch on startup.
 - Manual changes inside a configured namespace are not preserved. If the live namespace state differs from the NetForge config, NetForge will recreate the namespace rather than trying to preserve out-of-band edits.
@@ -71,6 +75,7 @@ Operationally, that means:
 - namespaces defined by NetForge are recreated every startup
 - manual drift inside a defined namespace is discarded in favor of config
 - manual firewall changes inside a defined namespace are also discarded
+- NetForge is not intended to coexist with other software managing independent named namespaces or alternative network topology on the same host
 
 If you change namespace reconciliation, preserve fail-closed behavior. Partial startup should not leave stale namespaces, leaked host links, half-configured runtime state, or an ambiguity about which namespaces NetForge owns.
 

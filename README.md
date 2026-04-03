@@ -2,6 +2,8 @@
 
 NetForge is a Linux-only Go program that builds and manages VLAN-backed network namespaces, applies nftables policy inside each namespace, and starts a sandboxed plugin child inside every managed namespace. It also exposes a small host dashboard and a per-namespace HTTP service for inspection and testing.
 
+NetForge is designed as appliance software. It is expected to be the only application-level software managing the server's network structure and named namespaces, and it enforces only the topology and namespaces it controls.
+
 ## What It Does
 
 - creates named network namespaces
@@ -26,7 +28,9 @@ NetForge is a Linux-only Go program that builds and manages VLAN-backed network 
 NetForge is destructive by design.
 
 - It runs as root.
+- It should be treated as appliance software and is expected to be the only higher-level system on the server managing named namespaces and the VLAN-backed network layout.
 - On startup, it treats the config as authoritative.
+- It enforces the configured namespace and network structure and does not accept unrelated named namespaces or parallel namespace management outside its control.
 - It removes all named namespaces it finds under `/run/netns`, then recreates only the configured namespaces.
 - This includes namespaces NetForge did not create.
 - Manual changes inside a configured namespace are not preserved.
