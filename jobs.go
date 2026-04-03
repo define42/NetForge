@@ -308,18 +308,39 @@ func (m *sftpSyncJobManager) StopJob(id int64) (*sftpSyncJob, error) {
 		return nil, err
 	}
 
-	m.mu.Lock()
-	runner := m.runners[id]
-	delete(m.runners, id)
-	m.mu.Unlock()
-	if runner.cancel != nil {
-		runner.cancel()
+	m.cancelRunner(id)
+
+	job, err := m.loadJob(id)
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+func (m *sftpSyncJobManager) DeleteJob(id int64) (*sftpSyncJob, error) {
+	if id < 1 {
+		return nil, fmt.Errorf("invalid job id %d", id)
 	}
 
 	job, err := m.loadJob(id)
 	if err != nil {
 		return nil, err
 	}
+
+	m.cancelRunner(id)
+
+	result, err := m.db.Exec(`DELETE FROM sftp_sync_jobs WHERE id = ?`, id)
+	if err != nil {
+		return nil, fmt.Errorf("delete sftp sync job %d: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("read sftp sync job %d delete count: %w", id, err)
+	}
+	if rows == 0 {
+		return nil, fmt.Errorf("sftp sync job %d not found", id)
+	}
+
 	return &job, nil
 }
 
@@ -374,6 +395,17 @@ func (m *sftpSyncJobManager) syncJob(job sftpSyncJob) (int, error) {
 	}
 
 	return syncSFTPDirectoryTree(sourceRPC, destinationRPC, job.From, job.To, job.From.Directory, job.To.Directory)
+}
+
+func (m *sftpSyncJobManager) cancelRunner(id int64) {
+	m.mu.Lock()
+	runner := m.runners[id]
+	delete(m.runners, id)
+	m.mu.Unlock()
+
+	if runner.cancel != nil {
+		runner.cancel()
+	}
 }
 
 func syncSFTPDirectoryTree(sourceRPC, destinationRPC NamespaceService, source, destination sftpEndpointConfig, sourceDir, destinationDir string) (int, error) {

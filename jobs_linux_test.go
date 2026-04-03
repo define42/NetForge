@@ -270,6 +270,105 @@ func TestSFTPSyncJobManagerPersistsJobs(t *testing.T) {
 	}
 }
 
+func TestSFTPSyncJobManagerDeleteStopsRunnerAndRemovesJob(t *testing.T) {
+	plugins := []*runningPlugin{
+		{cfg: NSConfig{Name: "srcns"}, rpc: &stubNamespaceService{}},
+		{cfg: NSConfig{Name: "dstns"}, rpc: &stubNamespaceService{}},
+	}
+	dbPath := filepath.Join(t.TempDir(), sftpJobsDBFilename)
+	manager, err := openSFTPSyncJobManager(dbPath, func(namespace string) *runningPlugin {
+		for _, plugin := range plugins {
+			if plugin.cfg.Name == namespace {
+				return plugin
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("openSFTPSyncJobManager failed: %v", err)
+	}
+	defer manager.Close()
+
+	job, err := manager.CreateJob(sftpSyncJobSpec{
+		From: sftpEndpointConfig{
+			Namespace: "srcns",
+			Host:      "10.0.0.1",
+			Port:      22,
+			Username:  "source",
+			Password:  "source-pass",
+			Directory: "/from",
+		},
+		To: sftpEndpointConfig{
+			Namespace: "dstns",
+			Host:      "10.0.0.2",
+			Port:      22,
+			Username:  "dest",
+			Password:  "dest-pass",
+			Directory: "/to",
+		},
+		Interval: 24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("CreateJob failed: %v", err)
+	}
+
+	if _, err := manager.StartJob(job.ID); err != nil {
+		t.Fatalf("StartJob failed: %v", err)
+	}
+
+	waitForJobSnapshot(t, manager, job.ID, func(view hostSFTPSyncJobView) bool {
+		return view.Enabled && view.Running
+	})
+
+	deleted, err := manager.DeleteJob(job.ID)
+	if err != nil {
+		t.Fatalf("DeleteJob failed: %v", err)
+	}
+	if deleted.ID != job.ID || deleted.From.Namespace != "srcns" || deleted.To.Namespace != "dstns" {
+		t.Fatalf("unexpected deleted job: %+v", deleted)
+	}
+
+	manager.mu.Lock()
+	_, exists := manager.runners[job.ID]
+	manager.mu.Unlock()
+	if exists {
+		t.Fatalf("runner for deleted job %d still registered", job.ID)
+	}
+
+	snapshot, err := manager.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	if len(snapshot) != 0 {
+		t.Fatalf("expected deleted job to be absent from snapshot, got %+v", snapshot)
+	}
+
+	if _, err := manager.DeleteJob(job.ID); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected deleting missing job to fail with not found, got %v", err)
+	}
+
+	manager2, err := openSFTPSyncJobManager(dbPath, func(namespace string) *runningPlugin {
+		for _, plugin := range plugins {
+			if plugin.cfg.Name == namespace {
+				return plugin
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reopen sftp job manager failed: %v", err)
+	}
+	defer manager2.Close()
+
+	snapshot, err = manager2.Snapshot()
+	if err != nil {
+		t.Fatalf("reloaded Snapshot failed: %v", err)
+	}
+	if len(snapshot) != 0 {
+		t.Fatalf("expected deleted job to stay deleted after reopen, got %+v", snapshot)
+	}
+}
+
 func TestStreamSFTPFileDeletesSourceOnlyAfterSuccessfulPush(t *testing.T) {
 	var (
 		mu     sync.Mutex
@@ -547,6 +646,29 @@ func TestHostDashboardServiceSFTPJobRoutes(t *testing.T) {
 	waitForJobSnapshot(t, manager, 1, func(view hostSFTPSyncJobView) bool {
 		return !view.Enabled && !view.Running
 	})
+
+	deleteReq := httptest.NewRequest(http.MethodPost, "/sftp-jobs/delete", strings.NewReader(startForm.Encode()))
+	deleteReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	deleteRec := httptest.NewRecorder()
+	service.routes().ServeHTTP(deleteRec, deleteReq)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("unexpected delete status code: got %d want %d", deleteRec.Code, http.StatusOK)
+	}
+	if !strings.Contains(deleteRec.Body.String(), "Deleted SFTP sync job #1") {
+		t.Fatalf("expected delete success message, got %s", deleteRec.Body.String())
+	}
+	if !strings.Contains(deleteRec.Body.String(), "no jobs configured") {
+		t.Fatalf("expected empty job table after delete, got %s", deleteRec.Body.String())
+	}
+
+	snapshot, err := manager.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot after delete failed: %v", err)
+	}
+	if len(snapshot) != 0 {
+		t.Fatalf("expected no jobs after delete, got %+v", snapshot)
+	}
 
 	wrongMethodReq := httptest.NewRequest(http.MethodGet, "/sftp-jobs/create", nil)
 	wrongMethodRec := httptest.NewRecorder()

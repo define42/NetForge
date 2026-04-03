@@ -628,6 +628,10 @@ pre {
 <button type="submit">Start</button>
 </form>
 {{end}}
+<form method="post" action="/sftp-jobs/delete">
+<input type="hidden" name="job_id" value="{{.ID}}">
+<button type="submit">Delete</button>
+</form>
 </td>
 </tr>
 {{else}}
@@ -921,6 +925,7 @@ func (s *hostDashboardService) routes() http.Handler {
 	mux.HandleFunc("/sftp-jobs/create", s.handleCreateSFTPJob)
 	mux.HandleFunc("/sftp-jobs/start", s.handleStartSFTPJob)
 	mux.HandleFunc("/sftp-jobs/stop", s.handleStopSFTPJob)
+	mux.HandleFunc("/sftp-jobs/delete", s.handleDeleteSFTPJob)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/namespaces", s.handleNamespacesAPI)
 	return mux
@@ -1191,6 +1196,40 @@ func (s *hostDashboardService) handleStartSFTPJob(w http.ResponseWriter, r *http
 
 func (s *hostDashboardService) handleStopSFTPJob(w http.ResponseWriter, r *http.Request) {
 	s.handleSFTPJobStateChange(w, r, false)
+}
+
+func (s *hostDashboardService) handleDeleteSFTPJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	data := s.snapshotWithContext(r.Context())
+	if s.jobManager == nil {
+		data.SFTPJobError = "sftp job manager unavailable"
+		s.renderIndex(w, data)
+		return
+	}
+
+	jobID, err := parseDashboardJobID(strings.TrimSpace(r.FormValue("job_id")))
+	if err != nil {
+		data.SFTPJobError = err.Error()
+		s.renderIndex(w, data)
+		return
+	}
+
+	job, err := s.jobManager.DeleteJob(jobID)
+	if err != nil {
+		data.SFTPJobError = err.Error()
+	} else {
+		data = s.snapshotWithContext(r.Context())
+		data.SFTPJobMessage = fmt.Sprintf("Deleted SFTP sync job #%d (%s -> %s).", job.ID, job.From.Namespace, job.To.Namespace)
+	}
+	s.renderIndex(w, data)
 }
 
 func (s *hostDashboardService) handleSFTPJobStateChange(w http.ResponseWriter, r *http.Request, start bool) {
