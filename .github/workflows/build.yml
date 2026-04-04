@@ -2,9 +2,11 @@ name: Build
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
+    tags-ignore:
+      - "v*"          # prevent infinite loops when pushing tags
   pull_request:
-    branches: ["main"]
+    branches: [ "main" ]
 
 jobs:
   build:
