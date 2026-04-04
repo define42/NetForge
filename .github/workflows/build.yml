@@ -51,7 +51,7 @@ jobs:
         run: |
           go build -ldflags="-s -w" -o netforge_linux_amd64 .
         env:
-          CGO_ENABLED: 1
+          CGO_ENABLED: 0
           GOOS: linux
           GOARCH: amd64
 
