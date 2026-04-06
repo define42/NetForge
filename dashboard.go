@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"log"
 	"net"
 	"net/http"
@@ -47,6 +46,9 @@ type hostDashboardData struct {
 	HostHTTPAddr          string                  `json:"host_http_addr"`
 	ParentNIC             string                  `json:"parent_nic"`
 	RuntimeBase           string                  `json:"runtime_base"`
+	CurrentPage           string                  `json:"-"`
+	PageTitle             string                  `json:"-"`
+	PageDescription       string                  `json:"-"`
 	Namespaces            []hostNamespaceView     `json:"namespaces"`
 	Jobs                  []hostSFTPSyncJobView   `json:"jobs,omitempty"`
 	JobsError             string                  `json:"jobs_error,omitempty"`
@@ -257,458 +259,7 @@ func appendDashboardError(existing *string, message string) {
 	*existing += "; " + message
 }
 
-var hostDashboardTemplate = template.Must(template.New("host-dashboard").Parse(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NetForge Dashboard</title>
-<style>
-body {
-	font-family: "Segoe UI", sans-serif;
-	margin: 0;
-	padding: 2rem;
-	background: linear-gradient(180deg, #f6f4ee 0%, #eef2f6 100%);
-	color: #183153;
-}
-h1 {
-	margin-top: 0;
-}
-.meta {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-	gap: 1rem;
-	margin: 1.5rem 0;
-}
-.card, table {
-	background: rgba(255, 255, 255, 0.92);
-	border: 1px solid #d7e0ea;
-	border-radius: 16px;
-	box-shadow: 0 16px 40px rgba(24, 49, 83, 0.08);
-}
-.card {
-	padding: 1rem 1.2rem;
-}
-table {
-	width: 100%;
-	border-collapse: collapse;
-	overflow: hidden;
-}
-th, td {
-	padding: 0.85rem 1rem;
-	text-align: left;
-	vertical-align: top;
-	border-bottom: 1px solid #e3e9f0;
-}
-th {
-	background: #183153;
-	color: #fff;
-	font-weight: 600;
-}
-tr:last-child td {
-	border-bottom: 0;
-}
-.status-ok {
-	color: #0d6b3c;
-	font-weight: 600;
-}
-.status-bad {
-	color: #9a3412;
-	font-weight: 600;
-}
-code {
-	font-size: 0.95em;
-}
-form {
-	margin: 0;
-}
-.ping-card {
-	margin-bottom: 1.5rem;
-}
-.probe-grid {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-	gap: 1rem;
-}
-.probe-pane h2 {
-	margin: 0 0 0.85rem;
-	font-size: 1.1rem;
-}
-.ping-form {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-	gap: 0.85rem;
-	align-items: end;
-}
-.ping-form label {
-	display: block;
-	font-weight: 600;
-}
-.ping-form input,
-.ping-form select,
-.ping-form button {
-	width: 100%;
-	box-sizing: border-box;
-	margin-top: 0.35rem;
-	padding: 0.7rem 0.8rem;
-	border-radius: 10px;
-	border: 1px solid #c8d3de;
-	font: inherit;
-}
-.ping-form button {
-	background: #183153;
-	color: #fff;
-	cursor: pointer;
-	font-weight: 600;
-}
-.ping-form button:hover {
-	background: #24456e;
-}
-pre {
-	margin: 0.85rem 0 0;
-	padding: 0.9rem 1rem;
-	background: #0f172a;
-	color: #e2e8f0;
-	border-radius: 12px;
-	overflow-x: auto;
-	white-space: pre-wrap;
-}
-</style>
-</head>
-<body>
-<h1>NetForge Dashboard</h1>
-<div class="meta">
-<div class="card"><strong>Host dashboard:</strong><br><code>{{.HostHTTPAddr}}</code></div>
-<div class="card"><strong>Parent NIC:</strong><br><code>{{.ParentNIC}}</code></div>
-<div class="card"><strong>Runtime base:</strong><br><code>{{.RuntimeBase}}</code></div>
-</div>
-<div class="card ping-card">
-<div class="probe-grid">
-<div class="probe-pane">
-<h2>Ping Target</h2>
-<form class="ping-form" method="post" action="/ping">
-<label>Namespace
-<select name="namespace" required>
-<option value="">Select namespace</option>
-{{range .Namespaces}}
-<option value="{{.Name}}" {{if eq $.SelectedPingNamespace .Name}}selected{{end}}>{{.Name}}</option>
-{{end}}
-</select>
-</label>
-<label>Target IP
-<input type="text" name="target_ip" placeholder="192.168.1.1" value="{{.PingTargetIP}}" required>
-</label>
-<div>
-<button type="submit">Ping From Namespace</button>
-</div>
-</form>
-{{if .PingResult}}
-<div style="margin-top: 1rem;">
-{{if .PingResult.Success}}
-<div class="status-ok">Ping succeeded: <code>{{.PingResult.Namespace}}</code> -> <code>{{.PingResult.TargetIP}}</code></div>
-{{else}}
-<div class="status-bad">Ping failed: <code>{{.PingResult.Namespace}}</code> -> <code>{{.PingResult.TargetIP}}</code>{{if .PingResult.Error}}<br>{{.PingResult.Error}}{{end}}</div>
-{{end}}
-{{if .PingResult.Output}}<pre>{{.PingResult.Output}}</pre>{{end}}
-</div>
-{{end}}
-</div>
-<div class="probe-pane">
-<h2>TCP Port Check</h2>
-<form class="ping-form" method="post" action="/tcp-check">
-<label>Namespace
-<select name="namespace" required>
-<option value="">Select namespace</option>
-{{range .Namespaces}}
-<option value="{{.Name}}" {{if eq $.SelectedTCPNamespace .Name}}selected{{end}}>{{.Name}}</option>
-{{end}}
-</select>
-</label>
-<label>Target IP
-<input type="text" name="target_ip" placeholder="192.168.1.1" value="{{.TCPTargetIP}}" required>
-</label>
-<label>TCP Port
-<input type="number" name="port" min="1" max="65535" placeholder="80" value="{{.TCPTargetPort}}" required>
-</label>
-<div>
-<button type="submit">Test TCP Port</button>
-</div>
-</form>
-{{if .TCPCheckResult}}
-<div style="margin-top: 1rem;">
-{{if .TCPCheckResult.Success}}
-<div class="status-ok">TCP port is open: <code>{{.TCPCheckResult.Namespace}}</code> -> <code>{{.TCPCheckResult.TargetIP}}:{{.TCPCheckResult.Port}}</code></div>
-{{else}}
-<div class="status-bad">TCP port check failed: <code>{{.TCPCheckResult.Namespace}}</code> -> <code>{{.TCPCheckResult.TargetIP}}:{{.TCPCheckResult.Port}}</code>{{if .TCPCheckResult.Error}}<br>{{.TCPCheckResult.Error}}{{end}}</div>
-{{end}}
-{{if .TCPCheckResult.Output}}<pre>{{.TCPCheckResult.Output}}</pre>{{end}}
-</div>
-{{end}}
-</div>
-<div class="probe-pane">
-<h2>SFTP File List</h2>
-<form class="ping-form" method="post" action="/sftp-list">
-<label>Namespace
-<select name="namespace" required>
-<option value="">Select namespace</option>
-{{range .Namespaces}}
-<option value="{{.Name}}" {{if eq $.SelectedSFTPNamespace .Name}}selected{{end}}>{{.Name}}</option>
-{{end}}
-</select>
-</label>
-<label>Server IP / Host
-<input type="text" name="server_host" placeholder="192.168.1.10" value="{{.SFTPServerHost}}" required>
-</label>
-<label>TCP Port
-<input type="number" name="port" min="1" max="65535" placeholder="22" value="{{.SFTPServerPort}}" required>
-</label>
-<label>User Name
-<input type="text" name="username" placeholder="deploy" value="{{.SFTPUsername}}" required>
-</label>
-<label>Password
-<input type="password" name="password" placeholder="password" required>
-</label>
-<label>Directory
-<input type="text" name="directory" placeholder="." value="{{.SFTPDirectory}}">
-</label>
-<div>
-<button type="submit">List SFTP Files</button>
-</div>
-</form>
-{{if .SFTPListResult}}
-<div style="margin-top: 1rem;">
-{{if .SFTPListResult.Success}}
-<div class="status-ok">SFTP list succeeded: <code>{{.SFTPListResult.Namespace}}</code> -> <code>{{.SFTPListResult.Server}}:{{.SFTPListResult.Port}}</code> as <code>{{.SFTPListResult.Username}}</code></div>
-{{else}}
-<div class="status-bad">SFTP list failed: <code>{{.SFTPListResult.Namespace}}</code> -> <code>{{.SFTPListResult.Server}}:{{.SFTPListResult.Port}}</code>{{if .SFTPListResult.Error}}<br>{{.SFTPListResult.Error}}{{end}}</div>
-{{end}}
-<div style="margin-top: 0.5rem;"><strong>Directory:</strong> <code>{{if .SFTPListResult.Directory}}{{.SFTPListResult.Directory}}{{else}}.{{end}}</code></div>
-{{if .SFTPListResult.Entries}}
-<table style="margin-top: 0.85rem;">
-<thead>
-<tr>
-<th>Path</th>
-<th>Type</th>
-<th>Size</th>
-<th>Mode</th>
-</tr>
-</thead>
-<tbody>
-{{range .SFTPListResult.Entries}}
-<tr>
-<td><code>{{.Path}}</code></td>
-<td><code>{{if .IsDir}}dir{{else}}file{{end}}</code></td>
-<td><code>{{.Size}}</code></td>
-<td><code>{{printf "%#o" .Mode}}</code></td>
-</tr>
-{{end}}
-</tbody>
-</table>
-{{else if .SFTPListResult.Success}}
-<pre>empty directory</pre>
-{{end}}
-</div>
-{{end}}
-</div>
-</div>
-</div>
-<div class="card ping-card">
-<h2>SFTP Sync Jobs</h2>
-<form class="ping-form" method="post" action="/sftp-jobs/create">
-<label>From Namespace
-<select name="from_namespace" required>
-<option value="">Select namespace</option>
-{{range .Namespaces}}
-<option value="{{.Name}}" {{if eq $.SFTPJobForm.FromNamespace .Name}}selected{{end}}>{{.Name}}</option>
-{{end}}
-</select>
-</label>
-<label>From Server IP / Host
-<input type="text" name="from_host" placeholder="192.168.1.10" value="{{.SFTPJobForm.FromHost}}" required>
-</label>
-<label>From TCP Port
-<input type="number" name="from_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.FromPort}}" required>
-</label>
-<label>From User Name
-<input type="text" name="from_username" placeholder="source-user" value="{{.SFTPJobForm.FromUsername}}" required>
-</label>
-<label>From Password
-<input type="password" name="from_password" placeholder="password" required>
-</label>
-<label>From Directory
-<input type="text" name="from_directory" placeholder="/incoming" value="{{.SFTPJobForm.FromDirectory}}" required>
-</label>
-<label>To Namespace
-<select name="to_namespace" required>
-<option value="">Select namespace</option>
-{{range .Namespaces}}
-<option value="{{.Name}}" {{if eq $.SFTPJobForm.ToNamespace .Name}}selected{{end}}>{{.Name}}</option>
-{{end}}
-</select>
-</label>
-<label>To Server IP / Host
-<input type="text" name="to_host" placeholder="192.168.1.20" value="{{.SFTPJobForm.ToHost}}" required>
-</label>
-<label>To TCP Port
-<input type="number" name="to_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.ToPort}}" required>
-</label>
-<label>To User Name
-<input type="text" name="to_username" placeholder="dest-user" value="{{.SFTPJobForm.ToUsername}}" required>
-</label>
-<label>To Password
-<input type="password" name="to_password" placeholder="password" required>
-</label>
-<label>To Directory
-<input type="text" name="to_directory" placeholder="/archive" value="{{.SFTPJobForm.ToDirectory}}" required>
-</label>
-<label>Run Interval
-<input type="text" name="interval" placeholder="5m" value="{{.SFTPJobForm.Interval}}" required>
-</label>
-<div>
-<button type="submit">Add SFTP Sync Job</button>
-</div>
-</form>
-{{if .SFTPJobMessage}}
-<div class="status-ok" style="margin-top: 1rem;">{{.SFTPJobMessage}}</div>
-{{end}}
-{{if .SFTPJobError}}
-<div class="status-bad" style="margin-top: 1rem;">{{.SFTPJobError}}</div>
-{{end}}
-{{if .JobsError}}
-<div class="status-bad" style="margin-top: 1rem;">{{.JobsError}}</div>
-{{end}}
-<table style="margin-top: 1rem;">
-<thead>
-<tr>
-<th>ID</th>
-<th>From</th>
-<th>To</th>
-<th>Interval</th>
-<th>State</th>
-<th>Last Result</th>
-<th>Controls</th>
-</tr>
-</thead>
-<tbody>
-{{range .Jobs}}
-<tr>
-<td><code>{{.ID}}</code></td>
-<td><code>{{.FromNamespace}}</code><br><code>{{.FromAddress}}</code><br><code>{{.FromUsername}}</code><br><code>{{.FromDirectory}}</code></td>
-<td><code>{{.ToNamespace}}</code><br><code>{{.ToAddress}}</code><br><code>{{.ToUsername}}</code><br><code>{{.ToDirectory}}</code></td>
-<td><code>{{.Interval}}</code></td>
-<td>
-{{if .Enabled}}
-<span class="status-ok">enabled</span>
-{{else}}
-<span class="status-bad">disabled</span>
-{{end}}
-<br>
-{{if .Running}}
-<code>scheduler running</code>
-{{else}}
-<code>scheduler stopped</code>
-{{end}}
-</td>
-<td>
-<code>{{if .LastStatus}}{{.LastStatus}}{{else}}idle{{end}}</code><br>
-<code>files copied {{.LastFilesCopied}}</code><br>
-{{if .LastRunAt}}<code>last run {{.LastRunAt}}</code><br>{{end}}
-{{if .LastSuccessAt}}<code>last success {{.LastSuccessAt}}</code><br>{{end}}
-{{if .LastError}}<span class="status-bad">{{.LastError}}</span>{{end}}
-</td>
-<td>
-{{if .Enabled}}
-<form method="post" action="/sftp-jobs/stop">
-<input type="hidden" name="job_id" value="{{.ID}}">
-<button type="submit">Stop</button>
-</form>
-{{else}}
-<form method="post" action="/sftp-jobs/start">
-<input type="hidden" name="job_id" value="{{.ID}}">
-<button type="submit">Start</button>
-</form>
-{{end}}
-<form method="post" action="/sftp-jobs/delete">
-<input type="hidden" name="job_id" value="{{.ID}}">
-<button type="submit">Delete</button>
-</form>
-</td>
-</tr>
-{{else}}
-<tr>
-<td colspan="7"><code>no jobs configured</code></td>
-</tr>
-{{end}}
-</tbody>
-</table>
-</div>
-<table>
-<thead>
-<tr>
-<th>Namespace</th>
-<th>VLAN</th>
-<th>Interface</th>
-<th>IP / Gateway</th>
-<th>MAC</th>
-<th>Plugin HTTP</th>
-<th>Open TCP</th>
-<th>ICMP</th>
-<th>ARP Table</th>
-<th>NIC Statistics</th>
-<th>Status</th>
-</tr>
-</thead>
-<tbody>
-{{range .Namespaces}}
-<tr>
-<td><code>{{.Name}}</code></td>
-<td>{{.VLANID}}</td>
-<td><code>{{.Interface}}</code></td>
-<td><code>{{.IPCIDR}}</code><br><code>{{if .Gateway}}{{.Gateway}}{{else}}none{{end}}</code></td>
-<td><code>{{.MAC}}</code></td>
-<td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
-<td><code>{{if .OpenPorts}}{{range $i, $port := .OpenPorts}}{{if $i}}, {{end}}{{$port}}{{end}}{{else}}none{{end}}</code></td>
-<td><code>{{if .AllowICMP}}icmp enabled{{else}}icmp disabled{{end}}</code></td>
-<td>
-{{if .ARPError}}
-<span class="status-bad">{{.ARPError}}</span>
-{{else if .ARPEntries}}
-{{range .ARPEntries}}
-<code>{{.IP}}</code><br><code>{{.MAC}}</code><br>
-{{end}}
-{{else}}
-<code>empty</code>
-{{end}}
-</td>
-<td>
-{{if .StatisticsError}}
-<span class="status-bad">{{.StatisticsError}}</span>
-{{else}}
-<code>rx bytes {{.Statistics.RxBytes}}</code><br>
-<code>rx pkts {{.Statistics.RxPackets}}</code><br>
-<code>rx errs {{.Statistics.RxErrors}}</code><br>
-<code>rx drop {{.Statistics.RxDropped}}</code><br>
-<code>tx bytes {{.Statistics.TxBytes}}</code><br>
-<code>tx pkts {{.Statistics.TxPackets}}</code><br>
-<code>tx errs {{.Statistics.TxErrors}}</code><br>
-<code>tx drop {{.Statistics.TxDropped}}</code>
-{{end}}
-</td>
-<td>
-{{if .Error}}
-<span class="status-bad">{{.Error}}</span>
-{{else if .HTTPRunning}}
-<span class="status-ok">running</span><br>{{.Message}}
-{{else}}
-<span class="status-bad">stopped</span><br>{{.Message}}
-{{end}}
-</td>
-</tr>
-{{end}}
-</tbody>
-</table>
-</body>
-</html>`))
+var hostDashboardTemplate = newHostDashboardTemplate()
 
 func (s *hostDashboardService) snapshot() hostDashboardData {
 	return s.snapshotWithContext(context.Background())
@@ -919,6 +470,9 @@ func lookupNamespaceNICStatistics(namespaceName, ifName string) (hostNICStatisti
 func (s *hostDashboardService) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/probes", s.handleProbesPage)
+	mux.HandleFunc("/sftp-jobs", s.handleSFTPJobsPage)
+	mux.HandleFunc("/configs", s.handleConfigsPage)
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/tcp-check", s.handleTCPCheck)
 	mux.HandleFunc("/sftp-list", s.handleSFTPList)
@@ -936,12 +490,45 @@ func (s *hostDashboardService) handleIndex(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
-	s.renderIndex(w, s.snapshotWithContext(r.Context()))
+	s.renderPage(w, s.snapshotPageWithContext(r.Context(), hostDashboardPageOverview))
 }
 
-func (s *hostDashboardService) renderIndex(w http.ResponseWriter, data hostDashboardData) {
+func (s *hostDashboardService) handleProbesPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/probes" {
+		http.NotFound(w, r)
+		return
+	}
+	s.renderPage(w, s.snapshotPageWithContext(r.Context(), hostDashboardPageProbes))
+}
+
+func (s *hostDashboardService) handleSFTPJobsPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/sftp-jobs" {
+		http.NotFound(w, r)
+		return
+	}
+	s.renderPage(w, s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs))
+}
+
+func (s *hostDashboardService) handleConfigsPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/configs" {
+		http.NotFound(w, r)
+		return
+	}
+	s.renderPage(w, s.snapshotPageWithContext(r.Context(), hostDashboardPageConfigs))
+}
+
+func (s *hostDashboardService) snapshotPageWithContext(ctx context.Context, page string) hostDashboardData {
+	data := s.snapshotWithContext(ctx)
+	applyDashboardPageMetadata(&data, page)
+	return data
+}
+
+func (s *hostDashboardService) renderPage(w http.ResponseWriter, data hostDashboardData) {
+	if data.CurrentPage == "" {
+		applyDashboardPageMetadata(&data, hostDashboardPageOverview)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := hostDashboardTemplate.Execute(w, data); err != nil {
+	if err := hostDashboardTemplate.ExecuteTemplate(w, "layout", data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -980,11 +567,11 @@ func (s *hostDashboardService) handlePing(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	data := s.snapshotWithContext(r.Context())
+	data := s.snapshotPageWithContext(r.Context(), hostDashboardPageProbes)
 	data.SelectedPingNamespace = namespaceName
 	data.PingTargetIP = targetIP
 	data.PingResult = result
-	s.renderIndex(w, data)
+	s.renderPage(w, data)
 }
 
 func (s *hostDashboardService) handleTCPCheck(w http.ResponseWriter, r *http.Request) {
@@ -1028,12 +615,12 @@ func (s *hostDashboardService) handleTCPCheck(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	data := s.snapshotWithContext(r.Context())
+	data := s.snapshotPageWithContext(r.Context(), hostDashboardPageProbes)
 	data.SelectedTCPNamespace = namespaceName
 	data.TCPTargetIP = targetIP
 	data.TCPTargetPort = portRaw
 	data.TCPCheckResult = result
-	s.renderIndex(w, data)
+	s.renderPage(w, data)
 }
 
 func (s *hostDashboardService) handleSFTPList(w http.ResponseWriter, r *http.Request) {
@@ -1094,14 +681,14 @@ func (s *hostDashboardService) handleSFTPList(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	data := s.snapshotWithContext(r.Context())
+	data := s.snapshotPageWithContext(r.Context(), hostDashboardPageProbes)
 	data.SelectedSFTPNamespace = namespaceName
 	data.SFTPServerHost = serverHost
 	data.SFTPServerPort = portRaw
 	data.SFTPUsername = username
 	data.SFTPDirectory = directory
 	data.SFTPListResult = result
-	s.renderIndex(w, data)
+	s.renderPage(w, data)
 }
 
 func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *http.Request) {
@@ -1130,33 +717,33 @@ func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *htt
 	fromPassword := r.FormValue("from_password")
 	toPassword := r.FormValue("to_password")
 
-	data := s.snapshotWithContext(r.Context())
+	data := s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs)
 	data.SFTPJobForm = form
 
 	if s.jobManager == nil {
 		data.SFTPJobError = "sftp job manager unavailable"
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
 	fromPort, err := strconv.Atoi(form.FromPort)
 	if err != nil || fromPort < 1 || fromPort > 65535 {
 		data.SFTPJobError = fmt.Sprintf("invalid source TCP port %q", form.FromPort)
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
 	toPort, err := strconv.Atoi(form.ToPort)
 	if err != nil || toPort < 1 || toPort > 65535 {
 		data.SFTPJobError = fmt.Sprintf("invalid destination TCP port %q", form.ToPort)
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
 	interval, err := parseDashboardJobInterval(form.Interval)
 	if err != nil {
 		data.SFTPJobError = err.Error()
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
@@ -1181,13 +768,13 @@ func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *htt
 	})
 	if err != nil {
 		data.SFTPJobError = err.Error()
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
-	data = s.snapshotWithContext(r.Context())
+	data = s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs)
 	data.SFTPJobMessage = fmt.Sprintf("Created SFTP sync job #%d. Start it when you are ready.", job.ID)
-	s.renderIndex(w, data)
+	s.renderPage(w, data)
 }
 
 func (s *hostDashboardService) handleStartSFTPJob(w http.ResponseWriter, r *http.Request) {
@@ -1208,17 +795,17 @@ func (s *hostDashboardService) handleDeleteSFTPJob(w http.ResponseWriter, r *htt
 		return
 	}
 
-	data := s.snapshotWithContext(r.Context())
+	data := s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs)
 	if s.jobManager == nil {
 		data.SFTPJobError = "sftp job manager unavailable"
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
 	jobID, err := parseDashboardJobID(strings.TrimSpace(r.FormValue("job_id")))
 	if err != nil {
 		data.SFTPJobError = err.Error()
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
@@ -1226,10 +813,10 @@ func (s *hostDashboardService) handleDeleteSFTPJob(w http.ResponseWriter, r *htt
 	if err != nil {
 		data.SFTPJobError = err.Error()
 	} else {
-		data = s.snapshotWithContext(r.Context())
+		data = s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs)
 		data.SFTPJobMessage = fmt.Sprintf("Deleted SFTP sync job #%d (%s -> %s).", job.ID, job.From.Namespace, job.To.Namespace)
 	}
-	s.renderIndex(w, data)
+	s.renderPage(w, data)
 }
 
 func (s *hostDashboardService) handleSFTPJobStateChange(w http.ResponseWriter, r *http.Request, start bool) {
@@ -1242,17 +829,17 @@ func (s *hostDashboardService) handleSFTPJobStateChange(w http.ResponseWriter, r
 		return
 	}
 
-	data := s.snapshotWithContext(r.Context())
+	data := s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs)
 	if s.jobManager == nil {
 		data.SFTPJobError = "sftp job manager unavailable"
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
 	jobID, err := parseDashboardJobID(strings.TrimSpace(r.FormValue("job_id")))
 	if err != nil {
 		data.SFTPJobError = err.Error()
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
@@ -1261,10 +848,10 @@ func (s *hostDashboardService) handleSFTPJobStateChange(w http.ResponseWriter, r
 		if err != nil {
 			data.SFTPJobError = err.Error()
 		} else {
-			data = s.snapshotWithContext(r.Context())
+			data = s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs)
 			data.SFTPJobMessage = fmt.Sprintf("Started SFTP sync job #%d (%s -> %s).", job.ID, job.From.Namespace, job.To.Namespace)
 		}
-		s.renderIndex(w, data)
+		s.renderPage(w, data)
 		return
 	}
 
@@ -1272,10 +859,10 @@ func (s *hostDashboardService) handleSFTPJobStateChange(w http.ResponseWriter, r
 	if err != nil {
 		data.SFTPJobError = err.Error()
 	} else {
-		data = s.snapshotWithContext(r.Context())
+		data = s.snapshotPageWithContext(r.Context(), hostDashboardPageJobs)
 		data.SFTPJobMessage = fmt.Sprintf("Stopped SFTP sync job #%d (%s -> %s).", job.ID, job.From.Namespace, job.To.Namespace)
 	}
-	s.renderIndex(w, data)
+	s.renderPage(w, data)
 }
 
 func (s *hostDashboardService) handleHealthz(w http.ResponseWriter, _ *http.Request) {

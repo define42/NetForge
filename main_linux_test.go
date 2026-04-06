@@ -1109,7 +1109,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		},
 	}
 
-	t.Run("html", func(t *testing.T) {
+	t.Run("overview html", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		rec := httptest.NewRecorder()
 
@@ -1120,9 +1120,109 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 
 		body := rec.Body.String()
-		for _, want := range []string{"NetForge Dashboard", "Ping From Namespace", "Test TCP Port", "SFTP File List", "List SFTP Files", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "10.10.100.1", "02:00:00:00:10:01", "10.10.100.3", "02:00:00:00:10:03", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "arp unavailable", "statistics unavailable", "plugin down"} {
+		for _, want := range []string{"NetForge Dashboard", "Overview", "Probes", "SFTP Jobs", "Configs", "Namespace Overview", "ns1", "eth0.100", "plugin ready", "19080", "icmp enabled", "10.10.100.1", "02:00:00:00:10:01", "10.10.100.3", "02:00:00:00:10:03", "rx bytes 1024", "tx drop 4", "ns2", "19081", "icmp disabled", "arp unavailable", "statistics unavailable", "plugin down"} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("dashboard body did not contain %q: %s", want, body)
+			}
+		}
+		for _, unwanted := range []string{"Ping From Namespace", "Add SFTP Sync Job", "Host dashboard:", "Parent NIC:", "Runtime base:"} {
+			if strings.Contains(body, unwanted) {
+				t.Fatalf("overview page unexpectedly contained %q: %s", unwanted, body)
+			}
+		}
+	})
+
+	t.Run("probes html", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/probes", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{"NetForge Dashboard", "Connectivity Probes", "Ping From Namespace", "Test TCP Port", "SFTP File List", "List SFTP Files"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("probes body did not contain %q: %s", want, body)
+			}
+		}
+		for _, unwanted := range []string{"rx bytes 1024", "Add SFTP Sync Job", "Host dashboard:", "Parent NIC:", "Runtime base:"} {
+			if strings.Contains(body, unwanted) {
+				t.Fatalf("probes page unexpectedly contained %q: %s", unwanted, body)
+			}
+		}
+	})
+
+	t.Run("sftp jobs html", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/sftp-jobs", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{"NetForge Dashboard", "SFTP Sync Jobs", "Add SFTP Sync Job", "no jobs configured"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("jobs body did not contain %q: %s", want, body)
+			}
+		}
+		for _, unwanted := range []string{"Ping From Namespace", "rx bytes 1024", "Host dashboard:", "Parent NIC:", "Runtime base:"} {
+			if strings.Contains(body, unwanted) {
+				t.Fatalf("jobs page unexpectedly contained %q: %s", unwanted, body)
+			}
+		}
+	})
+
+	t.Run("configs html", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/configs", nil)
+		rec := httptest.NewRecorder()
+
+		service.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d", rec.Code, http.StatusOK)
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{
+			"NetForge Dashboard",
+			"Configs",
+			"Host dashboard:",
+			"Parent NIC:",
+			"Runtime base:",
+			"Host Parameters",
+			"Namespace Parameters",
+			"HOST_HTTP_ADDR",
+			"PARENT_NIC",
+			"RUNTIME_BASE",
+			"127.0.0.1:8090",
+			"eth0",
+			"/var/lib/netforge",
+			"name",
+			"vlan_id",
+			"if_name",
+			"ip_cidr",
+			"listen_port",
+			"open_ports",
+			"allow_icmp",
+			"ns1",
+			"19080, 19443",
+			"true",
+			"ns2",
+			"false",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("configs body did not contain %q: %s", want, body)
+			}
+		}
+		for _, unwanted := range []string{"Ping From Namespace", "rx bytes 1024", "Add SFTP Sync Job"} {
+			if strings.Contains(body, unwanted) {
+				t.Fatalf("configs page unexpectedly contained %q: %s", unwanted, body)
 			}
 		}
 	})

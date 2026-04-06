@@ -141,6 +141,13 @@ The host dashboard defaults to:
 http://127.0.0.1:8090
 ```
 
+The dashboard is split into focused pages:
+
+- `/`: namespace overview, ARP table data, and NIC statistics
+- `/probes`: ping, TCP port, and SFTP directory checks
+- `/sftp-jobs`: scheduled SFTP sync job management
+- `/configs`: effective host parameters and namespace config values
+
 Keep it on loopback unless you intentionally add authentication, TLS, or a trusted reverse proxy in front of it.
 
 ## Code Layout
