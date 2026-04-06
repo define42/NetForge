@@ -35,11 +35,16 @@ type PluginConfig struct {
 type DescribeResponse struct {
 	Namespace string
 	HTTPAddr  string
+	SFTPAddr  string
 	Message   string
 }
 
 type StartHTTPResponse struct {
 	HTTPAddr string
+}
+
+type StartSFTPResponse struct {
+	SFTPAddr string
 }
 
 type CheckTCPPortRequest struct {
@@ -143,6 +148,35 @@ type SFTPDeleteResponse struct {
 	Removed bool   `json:"removed"`
 }
 
+type StartSFTPStageDownloadRequest struct {
+	JobID               int64              `json:"job_id"`
+	Connection          SFTPConnectionInfo `json:"connection"`
+	RemoteDirectory     string             `json:"remote_directory"`
+	LocalIncomingDir    string             `json:"local_incoming_dir"`
+	LocalTmpDir         string             `json:"local_tmp_dir"`
+	PollIntervalSeconds int64              `json:"poll_interval_seconds"`
+}
+
+type StartSFTPStageUploadRequest struct {
+	JobID               int64              `json:"job_id"`
+	Connection          SFTPConnectionInfo `json:"connection"`
+	RemoteDirectory     string             `json:"remote_directory"`
+	LocalIncomingDir    string             `json:"local_incoming_dir"`
+	LocalTmpDir         string             `json:"local_tmp_dir"`
+	LocalAckDir         string             `json:"local_ack_dir"`
+	PollIntervalSeconds int64              `json:"poll_interval_seconds"`
+}
+
+type SFTPStageWorkerStatus struct {
+	JobID         int64  `json:"job_id"`
+	Running       bool   `json:"running"`
+	LastPollAt    string `json:"last_poll_at,omitempty"`
+	LastSuccessAt string `json:"last_success_at,omitempty"`
+	LastError     string `json:"last_error,omitempty"`
+	LastFiles     int    `json:"last_files"`
+	TotalFiles    int    `json:"total_files"`
+}
+
 type StatusResponse struct {
 	Namespace   string
 	Interface   string
@@ -153,11 +187,14 @@ type StatusResponse struct {
 	AllowICMP   bool
 	HTTPAddr    string
 	HTTPRunning bool
+	SFTPAddr    string
+	SFTPRunning bool
 }
 
 type NamespaceService interface {
 	Describe() (*DescribeResponse, error)
 	StartHTTP(port int) (*StartHTTPResponse, error)
+	StartSFTP(port int) (*StartSFTPResponse, error)
 	CheckTCPPort(targetIP string, port int) (string, error)
 	SFTPList(req SFTPListRequest) (*SFTPListResponse, error)
 	SFTPFetch(req SFTPFetchRequest) (*SFTPFetchResponse, error)
@@ -165,7 +202,14 @@ type NamespaceService interface {
 	SFTPPush(req SFTPPushRequest) (*SFTPPushResponse, error)
 	SFTPPushChunk(req SFTPPushChunkRequest) (*SFTPPushChunkResponse, error)
 	SFTPDelete(req SFTPDeleteRequest) (*SFTPDeleteResponse, error)
+	StartSFTPStageDownload(req StartSFTPStageDownloadRequest) (*SFTPStageWorkerStatus, error)
+	StopSFTPStageDownload(jobID int64) (*SFTPStageWorkerStatus, error)
+	GetSFTPStageDownloadStatus(jobID int64) (*SFTPStageWorkerStatus, error)
+	StartSFTPStageUpload(req StartSFTPStageUploadRequest) (*SFTPStageWorkerStatus, error)
+	StopSFTPStageUpload(jobID int64) (*SFTPStageWorkerStatus, error)
+	GetSFTPStageUploadStatus(jobID int64) (*SFTPStageWorkerStatus, error)
 	StopHTTP() error
+	StopSFTP() error
 	Status() (*StatusResponse, error)
 }
 
@@ -207,6 +251,15 @@ func (s *namespaceServiceRPCServer) Describe(_ struct{}, resp *DescribeResponse)
 
 func (s *namespaceServiceRPCServer) StartHTTP(port int, resp *StartHTTPResponse) error {
 	out, err := s.Impl.StartHTTP(port)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) StartSFTP(port int, resp *StartSFTPResponse) error {
+	out, err := s.Impl.StartSFTP(port)
 	if err != nil {
 		return err
 	}
@@ -277,8 +330,66 @@ func (s *namespaceServiceRPCServer) SFTPDelete(req SFTPDeleteRequest, resp *SFTP
 	return nil
 }
 
+func (s *namespaceServiceRPCServer) StartSFTPStageDownload(req StartSFTPStageDownloadRequest, resp *SFTPStageWorkerStatus) error {
+	out, err := s.Impl.StartSFTPStageDownload(req)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) StopSFTPStageDownload(jobID int64, resp *SFTPStageWorkerStatus) error {
+	out, err := s.Impl.StopSFTPStageDownload(jobID)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) GetSFTPStageDownloadStatus(jobID int64, resp *SFTPStageWorkerStatus) error {
+	out, err := s.Impl.GetSFTPStageDownloadStatus(jobID)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) StartSFTPStageUpload(req StartSFTPStageUploadRequest, resp *SFTPStageWorkerStatus) error {
+	out, err := s.Impl.StartSFTPStageUpload(req)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) StopSFTPStageUpload(jobID int64, resp *SFTPStageWorkerStatus) error {
+	out, err := s.Impl.StopSFTPStageUpload(jobID)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) GetSFTPStageUploadStatus(jobID int64, resp *SFTPStageWorkerStatus) error {
+	out, err := s.Impl.GetSFTPStageUploadStatus(jobID)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
 func (s *namespaceServiceRPCServer) StopHTTP(_ struct{}, _ *struct{}) error {
 	return s.Impl.StopHTTP()
+}
+
+func (s *namespaceServiceRPCServer) StopSFTP(_ struct{}, _ *struct{}) error {
+	return s.Impl.StopSFTP()
 }
 
 func (s *namespaceServiceRPCServer) Status(_ struct{}, resp *StatusResponse) error {
@@ -303,6 +414,12 @@ func (c *namespaceServiceRPCClient) Describe() (*DescribeResponse, error) {
 func (c *namespaceServiceRPCClient) StartHTTP(port int) (*StartHTTPResponse, error) {
 	var out StartHTTPResponse
 	err := c.client.Call("Plugin.StartHTTP", port, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) StartSFTP(port int) (*StartSFTPResponse, error) {
+	var out StartSFTPResponse
+	err := c.client.Call("Plugin.StartSFTP", port, &out)
 	return &out, err
 }
 
@@ -348,9 +465,50 @@ func (c *namespaceServiceRPCClient) SFTPDelete(req SFTPDeleteRequest) (*SFTPDele
 	return &out, err
 }
 
+func (c *namespaceServiceRPCClient) StartSFTPStageDownload(req StartSFTPStageDownloadRequest) (*SFTPStageWorkerStatus, error) {
+	var out SFTPStageWorkerStatus
+	err := c.client.Call("Plugin.StartSFTPStageDownload", req, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) StopSFTPStageDownload(jobID int64) (*SFTPStageWorkerStatus, error) {
+	var out SFTPStageWorkerStatus
+	err := c.client.Call("Plugin.StopSFTPStageDownload", jobID, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) GetSFTPStageDownloadStatus(jobID int64) (*SFTPStageWorkerStatus, error) {
+	var out SFTPStageWorkerStatus
+	err := c.client.Call("Plugin.GetSFTPStageDownloadStatus", jobID, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) StartSFTPStageUpload(req StartSFTPStageUploadRequest) (*SFTPStageWorkerStatus, error) {
+	var out SFTPStageWorkerStatus
+	err := c.client.Call("Plugin.StartSFTPStageUpload", req, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) StopSFTPStageUpload(jobID int64) (*SFTPStageWorkerStatus, error) {
+	var out SFTPStageWorkerStatus
+	err := c.client.Call("Plugin.StopSFTPStageUpload", jobID, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) GetSFTPStageUploadStatus(jobID int64) (*SFTPStageWorkerStatus, error) {
+	var out SFTPStageWorkerStatus
+	err := c.client.Call("Plugin.GetSFTPStageUploadStatus", jobID, &out)
+	return &out, err
+}
+
 func (c *namespaceServiceRPCClient) StopHTTP() error {
 	var out struct{}
 	return c.client.Call("Plugin.StopHTTP", struct{}{}, &out)
+}
+
+func (c *namespaceServiceRPCClient) StopSFTP() error {
+	var out struct{}
+	return c.client.Call("Plugin.StopSFTP", struct{}{}, &out)
 }
 
 func (c *namespaceServiceRPCClient) Status() (*StatusResponse, error) {

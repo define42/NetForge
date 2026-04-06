@@ -41,6 +41,7 @@ type namespaceSFTPClient interface {
 	MkdirAll(string) error
 	Chmod(string, os.FileMode) error
 	Lstat(string) (os.FileInfo, error)
+	Rename(string, string) error
 	Remove(string) error
 	RemoveDirectory(string) error
 	Close() error
@@ -73,6 +74,10 @@ func (c *sshSFTPClient) Chmod(path string, mode os.FileMode) error {
 
 func (c *sshSFTPClient) Lstat(path string) (os.FileInfo, error) {
 	return c.client.Lstat(path)
+}
+
+func (c *sshSFTPClient) Rename(oldPath, newPath string) error {
+	return c.client.Rename(oldPath, newPath)
 }
 
 func (c *sshSFTPClient) Remove(path string) error {

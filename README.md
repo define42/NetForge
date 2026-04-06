@@ -1,6 +1,6 @@
 # NetForge
 
-NetForge is a Linux-only Go program that builds and manages VLAN-backed network namespaces, applies nftables policy inside each namespace, and starts a sandboxed plugin child inside every managed namespace. It also exposes a small host dashboard and a per-namespace HTTP service for inspection and testing.
+NetForge is a Linux-only Go program that builds and manages VLAN-backed network namespaces, applies nftables policy inside each namespace, and starts a sandboxed plugin child inside every managed namespace. It also exposes a small host dashboard plus per-namespace HTTP and SFTP services for inspection and testing.
 
 NetForge is designed as appliance software. It is expected to be the only application-level software managing the server's network structure and named namespaces, and it enforces only the topology and namespaces it controls.
 
@@ -11,7 +11,7 @@ NetForge is designed as appliance software. It is expected to be the only applic
 - configures IP, MAC, gateway, and namespace-local nftables rules
 - starts a go-plugin child inside each namespace
 - hardens the plugin child with user/mount/pid namespaces, `pivot_root`, dropped capabilities, seccomp, and cgroup v2 placement
-- exposes a host dashboard and per-namespace HTTP endpoints
+- exposes a host dashboard and per-namespace HTTP and SFTP endpoints
 
 ## Requirements
 
@@ -97,6 +97,8 @@ Each plugin also gets a persistent data directory mounted inside the sandbox at 
 
 The SFTP jobs database is also stored persistently at `/data/netforge/sftp-jobs.sqlite`.
 
+Each plugin also starts an embedded SFTP server on TCP port `2222`. It boots with no configured users yet, and it persists its SSH host key at `/data/netforge/plugin-data/<namespace>/sftp-host-key.pem`.
+
 Example:
 
 ```bash
@@ -131,6 +133,8 @@ sudo ./netforge
 ```
 
 If `open_ports` is omitted or `null`, NetForge defaults it to `[listen_port]`. If `open_ports` is an explicit empty array, no TCP ports are opened.
+
+If you want the per-namespace embedded SFTP server to accept inbound connections through the namespace firewall, include `2222` in `open_ports`.
 
 ## Default Behavior
 

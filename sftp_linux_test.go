@@ -7,12 +7,14 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"os"
 	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -83,6 +85,21 @@ func (c *localSFTPClient) Lstat(remotePath string) (os.FileInfo, error) {
 	return os.Lstat(localPath)
 }
 
+func (c *localSFTPClient) Rename(oldPath, newPath string) error {
+	localOldPath, err := c.resolve(oldPath)
+	if err != nil {
+		return err
+	}
+	localNewPath, err := c.resolve(newPath)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(localNewPath), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(localOldPath, localNewPath)
+}
+
 func (c *localSFTPClient) Remove(remotePath string) error {
 	localPath, err := c.resolve(remotePath)
 	if err != nil {
@@ -114,6 +131,22 @@ func withLocalSFTPClientFactory(t *testing.T, root string) {
 
 	original := openNamespaceSFTPClient
 	openNamespaceSFTPClient = func(SFTPConnectionInfo) (namespaceSFTPClient, error) {
+		return &localSFTPClient{root: root}, nil
+	}
+	t.Cleanup(func() {
+		openNamespaceSFTPClient = original
+	})
+}
+
+func withMappedLocalSFTPClientFactory(t *testing.T, roots map[string]string) {
+	t.Helper()
+
+	original := openNamespaceSFTPClient
+	openNamespaceSFTPClient = func(connInfo SFTPConnectionInfo) (namespaceSFTPClient, error) {
+		root, ok := roots[connInfo.Address]
+		if !ok {
+			return nil, fmt.Errorf("unexpected test sftp address %q", connInfo.Address)
+		}
 		return &localSFTPClient{root: root}, nil
 	}
 	t.Cleanup(func() {
@@ -490,4 +523,281 @@ func TestPushNamespaceSFTPWritesContent(t *testing.T) {
 	if string(data) != "hello" {
 		t.Fatalf("unexpected written data: %q", string(data))
 	}
+}
+
+func TestStageRemoteDirectoryToLocalDownloadsAndDeletesSource(t *testing.T) {
+	remoteRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(remoteRoot, "from", "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll remote root failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteRoot, "from", "alpha.txt"), []byte("alpha"), 0o640); err != nil {
+		t.Fatalf("WriteFile alpha failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteRoot, "from", "nested", "beta.txt"), []byte("beta"), 0o600); err != nil {
+		t.Fatalf("WriteFile beta failed: %v", err)
+	}
+
+	incomingDir := filepath.Join(t.TempDir(), "incoming")
+	tmpDir := filepath.Join(t.TempDir(), "tmp")
+	client := &localSFTPClient{root: remoteRoot}
+
+	files, err := stageRemoteDirectoryToLocal(client, "/from", "/from", incomingDir, tmpDir)
+	if err != nil {
+		t.Fatalf("stageRemoteDirectoryToLocal failed: %v", err)
+	}
+	if files != 2 {
+		t.Fatalf("unexpected staged file count: got %d want %d", files, 2)
+	}
+
+	alpha, err := os.ReadFile(filepath.Join(incomingDir, "alpha.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile staged alpha failed: %v", err)
+	}
+	if string(alpha) != "alpha" {
+		t.Fatalf("unexpected staged alpha content: %q", string(alpha))
+	}
+
+	betaInfo, err := os.Stat(filepath.Join(incomingDir, "nested", "beta.txt"))
+	if err != nil {
+		t.Fatalf("Stat staged beta failed: %v", err)
+	}
+	if betaInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("unexpected staged beta mode: %#o", betaInfo.Mode().Perm())
+	}
+
+	if _, err := os.Stat(filepath.Join(remoteRoot, "from", "alpha.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected remote alpha to be deleted, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "from", "nested", "beta.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected remote beta to be deleted, got %v", err)
+	}
+}
+
+func TestStageRemoteDirectoryToLocalLeavesDuplicateRemoteFile(t *testing.T) {
+	remoteRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(remoteRoot, "from"), 0o755); err != nil {
+		t.Fatalf("MkdirAll remote root failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteRoot, "from", "alpha.txt"), []byte("alpha"), 0o640); err != nil {
+		t.Fatalf("WriteFile alpha failed: %v", err)
+	}
+
+	incomingDir := filepath.Join(t.TempDir(), "incoming")
+	tmpDir := filepath.Join(t.TempDir(), "tmp")
+	if err := os.MkdirAll(incomingDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll incoming failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(incomingDir, "alpha.txt"), []byte("existing"), 0o640); err != nil {
+		t.Fatalf("WriteFile duplicate failed: %v", err)
+	}
+
+	client := &localSFTPClient{root: remoteRoot}
+	_, err := stageRemoteDirectoryToLocal(client, "/from", "/from", incomingDir, tmpDir)
+	if err == nil || !strings.Contains(err.Error(), "already contains") {
+		t.Fatalf("expected duplicate staging error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "from", "alpha.txt")); err != nil {
+		t.Fatalf("expected remote alpha to remain after duplicate, got %v", err)
+	}
+}
+
+func TestUploadLocalDirectoryToRemoteUploadsAndAcknowledges(t *testing.T) {
+	remoteRoot := t.TempDir()
+	incomingDir := filepath.Join(t.TempDir(), "incoming")
+	tmpDir := filepath.Join(t.TempDir(), "tmp")
+	ackDir := filepath.Join(t.TempDir(), "acks")
+	if err := os.MkdirAll(filepath.Join(incomingDir, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll incoming failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(incomingDir, "nested", "demo.txt"), []byte("payload"), 0o640); err != nil {
+		t.Fatalf("WriteFile demo failed: %v", err)
+	}
+
+	client := &localSFTPClient{root: remoteRoot}
+	files, err := uploadLocalDirectoryToRemote(client, incomingDir, tmpDir, ackDir, "/archive")
+	if err != nil {
+		t.Fatalf("uploadLocalDirectoryToRemote failed: %v", err)
+	}
+	if files != 1 {
+		t.Fatalf("unexpected uploaded file count: got %d want %d", files, 1)
+	}
+
+	data, err := os.ReadFile(filepath.Join(remoteRoot, "archive", "nested", "demo.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile remote demo failed: %v", err)
+	}
+	if string(data) != "payload" {
+		t.Fatalf("unexpected remote content: %q", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(incomingDir, "nested", "demo.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected local staged file to be removed, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(ackDir, "nested", "demo.txt")); err != nil {
+		t.Fatalf("expected ack marker to exist, got %v", err)
+	}
+}
+
+func TestRunHostSFTPStageBridgeCycleCopiesAndReapsAcks(t *testing.T) {
+	sourceIncomingDir := filepath.Join(t.TempDir(), "source-incoming")
+	destinationIncomingDir := filepath.Join(t.TempDir(), "destination-incoming")
+	destinationTmpDir := filepath.Join(t.TempDir(), "destination-tmp")
+	destinationAckDir := filepath.Join(t.TempDir(), "destination-acks")
+	if err := os.MkdirAll(filepath.Join(sourceIncomingDir, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll source incoming failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceIncomingDir, "nested", "demo.txt"), []byte("payload"), 0o640); err != nil {
+		t.Fatalf("WriteFile source demo failed: %v", err)
+	}
+
+	result, err := runHostSFTPStageBridgeCycle(sourceIncomingDir, destinationIncomingDir, destinationTmpDir, destinationAckDir)
+	if err != nil {
+		t.Fatalf("runHostSFTPStageBridgeCycle copy failed: %v", err)
+	}
+	if result.CopiedFiles != 1 || result.CompletedFiles != 0 {
+		t.Fatalf("unexpected copy cycle result: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(destinationIncomingDir, "nested", "demo.txt")); err != nil {
+		t.Fatalf("expected destination staged file to exist, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sourceIncomingDir, "nested", "demo.txt")); err != nil {
+		t.Fatalf("expected source staged file to remain before ack, got %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(destinationIncomingDir, "nested", "demo.txt")); err != nil {
+		t.Fatalf("Remove destination staged file failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(destinationAckDir, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll ack dir failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(destinationAckDir, "nested", "demo.txt"), []byte{}, 0o600); err != nil {
+		t.Fatalf("WriteFile ack marker failed: %v", err)
+	}
+
+	result, err = runHostSFTPStageBridgeCycle(sourceIncomingDir, destinationIncomingDir, destinationTmpDir, destinationAckDir)
+	if err != nil {
+		t.Fatalf("runHostSFTPStageBridgeCycle reap failed: %v", err)
+	}
+	if result.CompletedFiles != 1 {
+		t.Fatalf("unexpected reap cycle result: %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(sourceIncomingDir, "nested", "demo.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected source staged file to be removed after ack, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destinationAckDir, "nested", "demo.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected ack marker to be removed after reap, got %v", err)
+	}
+}
+
+func TestNamespaceHTTPServiceStageWorkersLifecycle(t *testing.T) {
+	sourceRemoteRoot := t.TempDir()
+	destinationRemoteRoot := t.TempDir()
+	withMappedLocalSFTPClientFactory(t, map[string]string{
+		"source:22":      sourceRemoteRoot,
+		"destination:22": destinationRemoteRoot,
+	})
+
+	if err := os.MkdirAll(filepath.Join(sourceRemoteRoot, "from"), 0o755); err != nil {
+		t.Fatalf("MkdirAll source remote failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRemoteRoot, "from", "alpha.txt"), []byte("alpha"), 0o640); err != nil {
+		t.Fatalf("WriteFile source alpha failed: %v", err)
+	}
+
+	downloadIncomingDir := filepath.Join(t.TempDir(), "download-incoming")
+	downloadTmpDir := filepath.Join(t.TempDir(), "download-tmp")
+	uploadTmpDir := filepath.Join(t.TempDir(), "upload-tmp")
+	uploadAckDir := filepath.Join(t.TempDir(), "upload-ack")
+
+	svc := &namespaceHTTPService{cfg: PluginConfig{Namespace: "ns-stage"}}
+	downloadStatus, err := svc.StartSFTPStageDownload(StartSFTPStageDownloadRequest{
+		JobID:               7,
+		Connection:          SFTPConnectionInfo{Address: "source:22", Username: "demo", Password: "secret", InsecureIgnoreHostKey: true},
+		RemoteDirectory:     "/from",
+		LocalIncomingDir:    downloadIncomingDir,
+		LocalTmpDir:         downloadTmpDir,
+		PollIntervalSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartSFTPStageDownload failed: %v", err)
+	}
+	if !downloadStatus.Running {
+		t.Fatalf("expected download worker to report running: %+v", downloadStatus)
+	}
+
+	waitForStageCondition(t, func() bool {
+		_, err := os.Stat(filepath.Join(downloadIncomingDir, "alpha.txt"))
+		return err == nil
+	})
+	if _, err := os.Stat(filepath.Join(sourceRemoteRoot, "from", "alpha.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected remote source file to be removed after stage download, got %v", err)
+	}
+
+	uploadStatus, err := svc.StartSFTPStageUpload(StartSFTPStageUploadRequest{
+		JobID:               8,
+		Connection:          SFTPConnectionInfo{Address: "destination:22", Username: "demo", Password: "secret", InsecureIgnoreHostKey: true},
+		RemoteDirectory:     "/archive",
+		LocalIncomingDir:    downloadIncomingDir,
+		LocalTmpDir:         uploadTmpDir,
+		LocalAckDir:         uploadAckDir,
+		PollIntervalSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("StartSFTPStageUpload failed: %v", err)
+	}
+	if !uploadStatus.Running {
+		t.Fatalf("expected upload worker to report running: %+v", uploadStatus)
+	}
+
+	waitForStageCondition(t, func() bool {
+		_, err := os.Stat(filepath.Join(destinationRemoteRoot, "archive", "alpha.txt"))
+		return err == nil
+	})
+	if _, err := os.Stat(filepath.Join(uploadAckDir, "alpha.txt")); err != nil {
+		t.Fatalf("expected upload ack marker to exist, got %v", err)
+	}
+
+	gotDownloadStatus, err := svc.GetSFTPStageDownloadStatus(7)
+	if err != nil {
+		t.Fatalf("GetSFTPStageDownloadStatus failed: %v", err)
+	}
+	if !gotDownloadStatus.Running || gotDownloadStatus.LastPollAt == "" {
+		t.Fatalf("unexpected download status: %+v", gotDownloadStatus)
+	}
+
+	gotUploadStatus, err := svc.GetSFTPStageUploadStatus(8)
+	if err != nil {
+		t.Fatalf("GetSFTPStageUploadStatus failed: %v", err)
+	}
+	if !gotUploadStatus.Running || gotUploadStatus.LastSuccessAt == "" {
+		t.Fatalf("unexpected upload status: %+v", gotUploadStatus)
+	}
+
+	stoppedDownloadStatus, err := svc.StopSFTPStageDownload(7)
+	if err != nil {
+		t.Fatalf("StopSFTPStageDownload failed: %v", err)
+	}
+	if stoppedDownloadStatus.Running {
+		t.Fatalf("expected stopped download worker status, got %+v", stoppedDownloadStatus)
+	}
+
+	stoppedUploadStatus, err := svc.StopSFTPStageUpload(8)
+	if err != nil {
+		t.Fatalf("StopSFTPStageUpload failed: %v", err)
+	}
+	if stoppedUploadStatus.Running {
+		t.Fatalf("expected stopped upload worker status, got %+v", stoppedUploadStatus)
+	}
+}
+
+func waitForStageCondition(t *testing.T, predicate func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if predicate() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for stage condition")
 }

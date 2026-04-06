@@ -67,7 +67,15 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, persistent
 		if err != nil {
 			return err
 		}
-		log.Printf("namespace=%s message=%q http=%s running=%v", desc.Namespace, desc.Message, status.HTTPAddr, status.HTTPRunning)
+		log.Printf(
+			"namespace=%s message=%q http=%s http_running=%v sftp=%s sftp_running=%v",
+			desc.Namespace,
+			desc.Message,
+			status.HTTPAddr,
+			status.HTTPRunning,
+			status.SFTPAddr,
+			status.SFTPRunning,
+		)
 	}
 
 	jobManager, err := openSFTPSyncJobManager(persistentSFTPJobsDBPath(persistentBase), func(namespace string) *runningPlugin {

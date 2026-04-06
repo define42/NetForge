@@ -644,12 +644,39 @@ pre {
 {{else}}
 <code>scheduler stopped</code>
 {{end}}
+<br>
+{{if .SourceStageRunning}}
+<code>source stage running</code>
+{{else}}
+<code>source stage stopped</code>
+{{end}}
+<br>
+{{if .BridgeStageRunning}}
+<code>host bridge running</code>
+{{else}}
+<code>host bridge stopped</code>
+{{end}}
+<br>
+{{if .DestinationStageRunning}}
+<code>destination stage running</code>
+{{else}}
+<code>destination stage stopped</code>
+{{end}}
 </td>
 <td>
 <code>{{if .LastStatus}}{{.LastStatus}}{{else}}idle{{end}}</code><br>
-<code>files copied {{.LastFilesCopied}}</code><br>
+<code>files completed total {{.LastFilesCopied}}</code><br>
 {{if .LastRunAt}}<code>last run {{.LastRunAt}}</code><br>{{end}}
 {{if .LastSuccessAt}}<code>last success {{.LastSuccessAt}}</code><br>{{end}}
+{{if .SourceStageLastRunAt}}<code>source last run {{.SourceStageLastRunAt}}</code><br>{{end}}
+{{if .SourceStageLastSuccessAt}}<code>source last success {{.SourceStageLastSuccessAt}}</code><br>{{end}}
+{{if .SourceStageLastError}}<span class="status-bad">source: {{.SourceStageLastError}}</span><br>{{end}}
+{{if .BridgeStageLastRunAt}}<code>bridge last run {{.BridgeStageLastRunAt}}</code><br>{{end}}
+{{if .BridgeStageLastSuccessAt}}<code>bridge last success {{.BridgeStageLastSuccessAt}}</code><br>{{end}}
+{{if .BridgeStageLastError}}<span class="status-bad">bridge: {{.BridgeStageLastError}}</span><br>{{end}}
+{{if .DestinationStageLastRunAt}}<code>destination last run {{.DestinationStageLastRunAt}}</code><br>{{end}}
+{{if .DestinationStageLastSuccessAt}}<code>destination last success {{.DestinationStageLastSuccessAt}}</code><br>{{end}}
+{{if .DestinationStageLastError}}<span class="status-bad">destination: {{.DestinationStageLastError}}</span><br>{{end}}
 {{if .LastError}}<span class="status-bad">{{.LastError}}</span>{{end}}
 </td>
 <td>

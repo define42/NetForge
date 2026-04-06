@@ -265,7 +265,7 @@ func TestPluginSandboxSeccompFilterDefinition(t *testing.T) {
 	}
 	group := filter.Policy.Syscalls[0]
 	names := group.Names
-	for _, want := range []string{"socket", "setsockopt", "read", "write", "exit_group"} {
+	for _, want := range []string{"socket", "setsockopt", "read", "write", "exit_group", "getrandom", "renameat"} {
 		if !slices.Contains(names, want) {
 			t.Fatalf("seccomp policy missing syscall %q", want)
 		}

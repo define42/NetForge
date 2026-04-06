@@ -24,11 +24,17 @@ import (
 )
 
 type namespaceHTTPService struct {
-	cfg        PluginConfig
-	mu         sync.Mutex
-	httpServer *http.Server
-	httpAddr   string
-	port       int
+	cfg                 PluginConfig
+	mu                  sync.Mutex
+	httpServer          *http.Server
+	httpAddr            string
+	httpPort            int
+	sftpServer          sftpServerLifecycle
+	sftpAddr            string
+	sftpPort            int
+	downloadWorkers     map[int64]sftpStageDownloadWorker
+	uploadWorkers       map[int64]sftpStageUploadWorker
+	nextSFTPStageWorker uint64
 }
 
 func (s *namespaceHTTPService) Describe() (*DescribeResponse, error) {
@@ -38,6 +44,7 @@ func (s *namespaceHTTPService) Describe() (*DescribeResponse, error) {
 	return &DescribeResponse{
 		Namespace: s.cfg.Namespace,
 		HTTPAddr:  s.httpAddr,
+		SFTPAddr:  s.sftpAddr,
 		Message:   "plugin ready",
 	}, nil
 }
@@ -47,8 +54,8 @@ func (s *namespaceHTTPService) StartHTTP(port int) (*StartHTTPResponse, error) {
 	defer s.mu.Unlock()
 
 	if s.httpServer != nil {
-		if s.port != port {
-			return nil, fmt.Errorf("http server already running on port %d", s.port)
+		if s.httpPort != port {
+			return nil, fmt.Errorf("http server already running on port %d", s.httpPort)
 		}
 		return &StartHTTPResponse{HTTPAddr: s.httpAddr}, nil
 	}
@@ -83,7 +90,7 @@ func (s *namespaceHTTPService) StartHTTP(port int) (*StartHTTPResponse, error) {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	s.port = port
+	s.httpPort = port
 	s.httpAddr = addr
 
 	go func(server *http.Server, listener net.Listener) {
@@ -114,7 +121,7 @@ func (s *namespaceHTTPService) StopHTTP() error {
 	err := s.httpServer.Shutdown(ctx)
 	s.httpServer = nil
 	s.httpAddr = ""
-	s.port = 0
+	s.httpPort = 0
 	return err
 }
 
@@ -132,6 +139,8 @@ func (s *namespaceHTTPService) Status() (*StatusResponse, error) {
 		AllowICMP:   s.cfg.AllowICMP,
 		HTTPAddr:    s.httpAddr,
 		HTTPRunning: s.httpServer != nil,
+		SFTPAddr:    s.sftpAddr,
+		SFTPRunning: s.sftpServer != nil,
 	}, nil
 }
 
@@ -319,6 +328,7 @@ func (p *runningPlugin) Stop() {
 		return
 	}
 	if p.rpc != nil {
+		_ = p.rpc.StopSFTP()
 		_ = p.rpc.StopHTTP()
 	}
 	if p.client != nil {
@@ -469,6 +479,14 @@ func startNamespacePlugin(selfBinary, runtimeBase, persistentBase string, cfg NS
 			cleanupPluginCgroup(cmdRunner.cgroup)
 		}
 		return nil, fmt.Errorf("start namespace http server in %s: %w", cfg.Name, err)
+	}
+
+	if _, err := svc.StartSFTP(pluginSFTPPort); err != nil {
+		client.Kill()
+		if cmdRunner != nil {
+			cleanupPluginCgroup(cmdRunner.cgroup)
+		}
+		return nil, fmt.Errorf("start namespace sftp server in %s: %w", cfg.Name, err)
 	}
 
 	rp := &runningPlugin{cfg: cfg, client: client, rpc: svc}

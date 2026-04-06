@@ -518,11 +518,16 @@ func pluginSandboxSeccompFilter() seccomp.Filter {
 						"exit_group",
 						"fcntl",
 						"fstat",
+						"fchmod",
+						"fchmodat",
 						"fsync",
 						"futex",
+						"getdents",
+						"getdents64",
 						"getegid",
 						"geteuid",
 						"getgid",
+						"getrandom",
 						"getpeername",
 						"getpid",
 						"getppid",
@@ -535,6 +540,8 @@ func pluginSandboxSeccompFilter() seccomp.Filter {
 						"lseek",
 						"madvise",
 						"membarrier",
+						"mkdir",
+						"mkdirat",
 						"mmap",
 						"mprotect",
 						"munmap",
@@ -554,6 +561,9 @@ func pluginSandboxSeccompFilter() seccomp.Filter {
 						"recvfrom",
 						"recvmsg",
 						"recvmmsg",
+						"rename",
+						"renameat",
+						"renameat2",
 						"restart_syscall",
 						"rseq",
 						"rt_sigaction",
@@ -651,6 +661,23 @@ func runPluginSandboxSeccompProbe() error {
 
 	if err := pluginSandboxLoadFilter(pluginSandboxSeccompFilter()); err != nil {
 		return fmt.Errorf("load seccomp filter: %w", err)
+	}
+
+	var randomProbe [32]byte
+	if _, err := unix.Getrandom(randomProbe[:], 0); err != nil {
+		return fmt.Errorf("getrandom after seccomp failed: %w", err)
+	}
+
+	renameSource := filepath.Join(socketDir, "rename-src")
+	renameTarget := filepath.Join(socketDir, "rename-dst")
+	if err := os.WriteFile(renameSource, []byte("probe"), 0o600); err != nil {
+		return fmt.Errorf("write rename probe source failed: %w", err)
+	}
+	if err := os.Rename(renameSource, renameTarget); err != nil {
+		return fmt.Errorf("rename after seccomp failed: %w", err)
+	}
+	if err := os.Remove(renameTarget); err != nil {
+		return fmt.Errorf("cleanup rename probe target failed: %w", err)
 	}
 
 	if err := pluginSandboxProbeListenAndDial("tcp", "127.0.0.1:0"); err != nil {

@@ -83,7 +83,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			MAC:        "02:00:00:00:01:01",
 			Gateway:    "192.168.1.1",
 			ListenPort: 8080,
-			OpenPorts:  []int{8080},
+			OpenPorts:  []int{8080, 2222},
 			AllowICMP:  false,
 		},
 		{
@@ -94,7 +94,7 @@ func defaultConfigs(parentNIC string) []NSConfig {
 			MAC:        "02:00:00:00:02:02",
 			Gateway:    "192.168.2.1",
 			ListenPort: 8080,
-			OpenPorts:  []int{8080},
+			OpenPorts:  []int{8080, 2222},
 			AllowICMP:  true,
 		},
 	}
