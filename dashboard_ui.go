@@ -80,6 +80,10 @@ h1, h2 {
 	margin: 0.4rem 0 0;
 	max-width: 62ch;
 	color: var(--muted);
+	line-height: 1.4;
+}
+.page-lede {
+	min-height: 2.8rem;
 }
 .site-nav {
 	display: flex;
@@ -162,12 +166,9 @@ code {
 form {
 	margin: 0;
 }
-.probe-card {
-	margin-bottom: 1.5rem;
-}
 .probe-grid {
 	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+	grid-template-columns: 1fr;
 	gap: 1rem;
 }
 .probe-pane h2 {
@@ -283,7 +284,7 @@ pre {
 <td><code>{{.Interface}}</code></td>
 <td><code>{{.IPCIDR}}</code><br><code>{{if .Gateway}}{{.Gateway}}{{else}}none{{end}}</code></td>
 <td><code>{{.MAC}}</code></td>
-<td><code>{{.PluginHTTPAddr}}</code><br>configured port {{.ListenPort}}</td>
+<td><code>{{.ListenPort}}</code></td>
 <td><code>{{if .OpenPorts}}{{range $i, $port := .OpenPorts}}{{if $i}}, {{end}}{{$port}}{{end}}{{else}}none{{end}}</code></td>
 <td><code>{{if .AllowICMP}}icmp enabled{{else}}icmp disabled{{end}}</code></td>
 <td>
@@ -405,9 +406,8 @@ pre {
 <h2>Connectivity Probes</h2>
 <p class="section-copy">Operational checks live on their own page so you can troubleshoot connectivity without the namespace inventory competing for space.</p>
 </div>
-<div class="card probe-card">
 <div class="probe-grid">
-<div class="probe-pane">
+<div class="probe-pane card">
 <h2>Ping Target</h2>
 <form class="form-grid" method="post" action="/ping">
 <label>Namespace
@@ -436,7 +436,7 @@ pre {
 </div>
 {{end}}
 </div>
-<div class="probe-pane">
+<div class="probe-pane card">
 <h2>TCP Port Check</h2>
 <form class="form-grid" method="post" action="/tcp-check">
 <label>Namespace
@@ -468,7 +468,7 @@ pre {
 </div>
 {{end}}
 </div>
-<div class="probe-pane">
+<div class="probe-pane card">
 <h2>SFTP File List</h2>
 <form class="form-grid" method="post" action="/sftp-list">
 <label>Namespace
@@ -534,7 +534,6 @@ pre {
 {{end}}
 </div>
 {{end}}
-</div>
 </div>
 </div>
 </div>{{end}}
