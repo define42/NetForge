@@ -328,11 +328,6 @@ pre {
 </div>{{end}}
 
 {{define "configs"}}<div class="section-stack">
-<div class="meta">
-<div class="card"><strong>Host dashboard:</strong><br><code>{{.HostHTTPAddr}}</code></div>
-<div class="card"><strong>Parent NIC:</strong><br><code>{{.ParentNIC}}</code></div>
-<div class="card"><strong>Runtime base:</strong><br><code>{{.RuntimeBase}}</code></div>
-</div>
 <div class="card">
 <h2>Configs</h2>
 <p class="section-copy">This page shows the effective host parameters and the namespace configuration values the dashboard is currently using.</p>

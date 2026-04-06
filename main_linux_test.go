@@ -1192,9 +1192,6 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		for _, want := range []string{
 			"NetForge Dashboard",
 			"Configs",
-			"Host dashboard:",
-			"Parent NIC:",
-			"Runtime base:",
 			"Host Parameters",
 			"Namespace Parameters",
 			"HOST_HTTP_ADDR",
@@ -1220,7 +1217,7 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 				t.Fatalf("configs body did not contain %q: %s", want, body)
 			}
 		}
-		for _, unwanted := range []string{"Ping From Namespace", "rx bytes 1024", "Add SFTP Sync Job"} {
+		for _, unwanted := range []string{"Ping From Namespace", "rx bytes 1024", "Add SFTP Sync Job", "Host dashboard:", "Parent NIC:", "Runtime base:"} {
 			if strings.Contains(body, unwanted) {
 				t.Fatalf("configs page unexpectedly contained %q: %s", unwanted, body)
 			}
