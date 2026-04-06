@@ -68,7 +68,7 @@ func resetSandboxTestHooks(t *testing.T) {
 }
 
 func TestNewPluginSandboxSpec(t *testing.T) {
-	spec, err := newPluginSandboxSpec("/tmp/netforge", "/tmp/netforge/plugin-dir")
+	spec, err := newPluginSandboxSpec("/tmp/netforge", "/tmp/netforge/plugin-dir", "/tmp/plugin-data/ns1")
 	if err != nil {
 		t.Fatalf("newPluginSandboxSpec failed: %v", err)
 	}
@@ -79,8 +79,14 @@ func TestNewPluginSandboxSpec(t *testing.T) {
 	if spec.hostSocketDir != "/tmp/netforge/plugin-dir" {
 		t.Fatalf("unexpected sandbox host socket dir: %q", spec.hostSocketDir)
 	}
+	if spec.hostDataDir != "/tmp/plugin-data/ns1" {
+		t.Fatalf("unexpected sandbox host data dir: %q", spec.hostDataDir)
+	}
 	if spec.pluginSocketDir != pluginSandboxSocketDir {
 		t.Fatalf("unexpected sandbox plugin socket dir: %q", spec.pluginSocketDir)
+	}
+	if spec.pluginDataDir != pluginSandboxDataDir {
+		t.Fatalf("unexpected sandbox plugin data dir: %q", spec.pluginDataDir)
 	}
 	if spec.uid != pluginSandboxUID || spec.gid != pluginSandboxGID {
 		t.Fatalf("unexpected sandbox uid/gid: %d/%d", spec.uid, spec.gid)
@@ -90,10 +96,11 @@ func TestNewPluginSandboxSpec(t *testing.T) {
 func TestLoadPluginSandboxSpecFromEnv(t *testing.T) {
 	root := t.TempDir()
 	socketDir := t.TempDir()
+	dataDir := t.TempDir()
 
 	t.Setenv(envPluginSandboxRoot, root)
 	t.Setenv(envPluginSandboxHostSocketDir, socketDir)
-	t.Setenv(envPluginSandboxSocketDir, pluginSandboxSocketDir)
+	t.Setenv(envPluginSandboxHostDataDir, dataDir)
 
 	spec, err := loadPluginSandboxSpecFromEnv()
 	if err != nil {
@@ -105,8 +112,14 @@ func TestLoadPluginSandboxSpecFromEnv(t *testing.T) {
 	if spec.hostSocketDir != socketDir {
 		t.Fatalf("unexpected hostSocketDir: %q", spec.hostSocketDir)
 	}
+	if spec.hostDataDir != dataDir {
+		t.Fatalf("unexpected hostDataDir: %q", spec.hostDataDir)
+	}
 	if spec.pluginSocketDir != pluginSandboxSocketDir {
 		t.Fatalf("unexpected pluginSocketDir: %q", spec.pluginSocketDir)
+	}
+	if spec.pluginDataDir != pluginSandboxDataDir {
+		t.Fatalf("unexpected pluginDataDir: %q", spec.pluginDataDir)
 	}
 }
 
@@ -115,12 +128,15 @@ func TestPluginSandboxSpecValidateErrors(t *testing.T) {
 		name string
 		spec pluginSandboxSpec
 	}{
-		{name: "missing root", spec: pluginSandboxSpec{hostSocketDir: "/tmp/socket", pluginSocketDir: pluginSandboxSocketDir}},
-		{name: "relative root", spec: pluginSandboxSpec{rootDir: "root", hostSocketDir: "/tmp/socket", pluginSocketDir: pluginSandboxSocketDir}},
-		{name: "missing socket dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", pluginSocketDir: pluginSandboxSocketDir}},
-		{name: "relative socket dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "socket", pluginSocketDir: pluginSandboxSocketDir}},
-		{name: "relative plugin dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "/tmp/socket", pluginSocketDir: "run/go-plugin"}},
-		{name: "negative ids", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "/tmp/socket", pluginSocketDir: pluginSandboxSocketDir, uid: -1, gid: -1}},
+		{name: "missing root", spec: pluginSandboxSpec{hostSocketDir: "/tmp/socket", hostDataDir: "/tmp/data", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: pluginSandboxDataDir}},
+		{name: "relative root", spec: pluginSandboxSpec{rootDir: "root", hostSocketDir: "/tmp/socket", hostDataDir: "/tmp/data", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: pluginSandboxDataDir}},
+		{name: "missing socket dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostDataDir: "/tmp/data", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: pluginSandboxDataDir}},
+		{name: "relative socket dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "socket", hostDataDir: "/tmp/data", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: pluginSandboxDataDir}},
+		{name: "missing data dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "/tmp/socket", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: pluginSandboxDataDir}},
+		{name: "relative data dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "/tmp/socket", hostDataDir: "data", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: pluginSandboxDataDir}},
+		{name: "relative plugin dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "/tmp/socket", hostDataDir: "/tmp/data", pluginSocketDir: "run/go-plugin", pluginDataDir: pluginSandboxDataDir}},
+		{name: "relative plugin data dir", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "/tmp/socket", hostDataDir: "/tmp/data", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: "data"}},
+		{name: "negative ids", spec: pluginSandboxSpec{rootDir: "/tmp/root", hostSocketDir: "/tmp/socket", hostDataDir: "/tmp/data", pluginSocketDir: pluginSandboxSocketDir, pluginDataDir: pluginSandboxDataDir, uid: -1, gid: -1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.spec.validate(); err == nil {
@@ -183,7 +199,9 @@ func TestPluginSandboxHelpers(t *testing.T) {
 	spec := pluginSandboxSpec{
 		rootDir:         "/tmp/sandbox-root",
 		hostSocketDir:   "/tmp/plugin-dir",
+		hostDataDir:     "/tmp/plugin-data",
 		pluginSocketDir: pluginSandboxSocketDir,
+		pluginDataDir:   pluginSandboxDataDir,
 		uid:             pluginSandboxUID,
 		gid:             pluginSandboxGID,
 	}
@@ -201,6 +219,9 @@ func TestPluginSandboxHelpers(t *testing.T) {
 	}
 	if !slices.Contains(env, envPluginSandboxHostSocketDir+"="+spec.hostSocketDir) {
 		t.Fatalf("sandbox env missing host socket dir: %+v", env)
+	}
+	if !slices.Contains(env, envPluginSandboxHostDataDir+"="+spec.hostDataDir) {
+		t.Fatalf("sandbox env missing host data dir: %+v", env)
 	}
 	if !slices.Contains(env, envPluginSandboxStage+"="+pluginSandboxStageBootstrap) {
 		t.Fatalf("sandbox env missing bootstrap stage: %+v", env)
@@ -346,7 +367,7 @@ func TestPluginSandboxSeccompFilterAllowsNetworkingAndBlocksExecve(t *testing.T)
 func TestEnsurePluginSandboxRejectsUnknownStage(t *testing.T) {
 	t.Setenv(envPluginSandboxRoot, t.TempDir())
 	t.Setenv(envPluginSandboxHostSocketDir, t.TempDir())
-	t.Setenv(envPluginSandboxSocketDir, pluginSandboxSocketDir)
+	t.Setenv(envPluginSandboxHostDataDir, t.TempDir())
 	t.Setenv(envPluginSandboxStage, "unknown")
 
 	if err := ensurePluginSandbox(); err == nil {
@@ -359,10 +380,13 @@ func TestPluginSandboxPrepareFilesystem(t *testing.T) {
 
 	root := t.TempDir()
 	socketDir := t.TempDir()
+	dataDir := t.TempDir()
 	spec := pluginSandboxSpec{
 		rootDir:         filepath.Join(root, "sandbox-root"),
 		hostSocketDir:   socketDir,
+		hostDataDir:     dataDir,
 		pluginSocketDir: pluginSandboxSocketDir,
+		pluginDataDir:   pluginSandboxDataDir,
 		uid:             pluginSandboxUID,
 		gid:             pluginSandboxGID,
 	}
@@ -406,6 +430,7 @@ func TestPluginSandboxPrepareFilesystem(t *testing.T) {
 
 	for _, path := range []string{
 		spec.rootDir,
+		spec.rootPath(spec.pluginDataDir),
 		spec.rootPath("/run"),
 		spec.rootPath(spec.pluginSocketDir),
 		spec.rootPath(pluginSandboxProcDir),
@@ -440,6 +465,7 @@ func TestPluginSandboxPrepareFilesystem(t *testing.T) {
 	wantTargets := []string{
 		fmt.Sprintf("|/||%d|", uintptr(unix.MS_REC|unix.MS_PRIVATE)),
 		fmt.Sprintf("%s|%s||%d|", socketDir, spec.rootPath(spec.pluginSocketDir), uintptr(unix.MS_BIND)),
+		fmt.Sprintf("%s|%s||%d|", dataDir, spec.rootPath(spec.pluginDataDir), uintptr(unix.MS_BIND)),
 		fmt.Sprintf("proc|%s|proc|%d|", spec.rootPath(pluginSandboxProcDir), uintptr(unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC)),
 		fmt.Sprintf("tmpfs|%s|tmpfs|%d|mode=1777,size=16777216", spec.rootPath(pluginSandboxTmpDir), uintptr(unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC)),
 		fmt.Sprintf("%s|%s||%d|", spec.rootDir, spec.rootDir, uintptr(unix.MS_BIND|unix.MS_REC)),
@@ -578,10 +604,13 @@ func TestPluginSandboxBootstrapAndExec(t *testing.T) {
 
 	root := t.TempDir()
 	socketDir := t.TempDir()
+	dataDir := t.TempDir()
 	spec := pluginSandboxSpec{
 		rootDir:         filepath.Join(root, "sandbox-root"),
 		hostSocketDir:   socketDir,
+		hostDataDir:     dataDir,
 		pluginSocketDir: pluginSandboxSocketDir,
+		pluginDataDir:   pluginSandboxDataDir,
 		uid:             pluginSandboxUID,
 		gid:             pluginSandboxGID,
 	}
@@ -695,10 +724,13 @@ func TestSandboxHelperProcess(t *testing.T) {
 
 	root := os.Getenv(envPluginSandboxRoot)
 	socketDir := os.Getenv(envPluginSandboxHostSocketDir)
+	dataDir := os.Getenv(envPluginSandboxHostDataDir)
 	spec := pluginSandboxSpec{
 		rootDir:         root,
 		hostSocketDir:   socketDir,
+		hostDataDir:     dataDir,
 		pluginSocketDir: pluginSandboxSocketDir,
+		pluginDataDir:   pluginSandboxDataDir,
 		uid:             pluginSandboxUID,
 		gid:             pluginSandboxGID,
 	}
@@ -738,6 +770,7 @@ func TestSandboxHelperSubprocesses(t *testing.T) {
 
 	root := t.TempDir()
 	socketDir := t.TempDir()
+	dataDir := t.TempDir()
 	marker := filepath.Join(socketDir, "marker.txt")
 	if err := os.WriteFile(marker, []byte("ok"), 0o644); err != nil {
 		t.Fatalf("write marker failed: %v", err)
@@ -751,7 +784,7 @@ func TestSandboxHelperSubprocesses(t *testing.T) {
 			"NETFORGE_SANDBOX_HELPER="+mode,
 			envPluginSandboxRoot+"="+root,
 			envPluginSandboxHostSocketDir+"="+socketDir,
-			envPluginSandboxSocketDir+"="+pluginSandboxSocketDir,
+			envPluginSandboxHostDataDir+"="+dataDir,
 		)
 		if mode == "ensure-bootstrap-fail-mount-private" {
 			cmd.Env = append(cmd.Env, envPluginSandboxStage+"="+pluginSandboxStageBootstrap)
@@ -783,6 +816,10 @@ func TestSandboxHelperSubprocesses(t *testing.T) {
 		if _, err := os.Stat(socketTarget); err != nil {
 			t.Fatalf("expected sandbox socket target to exist, got: %v", err)
 		}
+		dataTarget := filepath.Join(root, "data")
+		if _, err := os.Stat(dataTarget); err != nil {
+			t.Fatalf("expected sandbox data target to exist, got: %v", err)
+		}
 	})
 
 	t.Run("drop privileges failpoint", func(t *testing.T) {
@@ -811,7 +848,7 @@ func TestStartNamespacePluginFailsClosedOnSandboxBootstrapError(t *testing.T) {
 		t.Run(step, func(t *testing.T) {
 			t.Setenv(envPluginSandboxFailStep, step)
 
-			proc, err := startNamespacePlugin(bin, t.TempDir(), cfg)
+			proc, err := startNamespacePlugin(bin, t.TempDir(), t.TempDir(), cfg)
 			if err == nil {
 				if proc != nil {
 					proc.Stop()
@@ -840,6 +877,12 @@ func assertPluginSandboxed(t *testing.T, proc *runningPlugin) {
 	rootInfo, err := os.Stat(fmt.Sprintf("/proc/%d/root", proc.pid))
 	if err != nil {
 		t.Fatalf("stat proc root failed: %v", err)
+	}
+	if _, err := os.Stat(proc.sandbox.hostDataDir); err != nil {
+		t.Fatalf("stat host data dir failed: %v", err)
+	}
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root%s", proc.pid, proc.sandbox.pluginDataDir)); err != nil {
+		t.Fatalf("stat sandbox data dir failed: %v", err)
 	}
 	sandboxInfo, err := os.Stat(proc.sandbox.rootDir)
 	if err != nil {

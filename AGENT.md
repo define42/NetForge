@@ -41,7 +41,8 @@ The host process uses these environment variables:
 - `HOST_HTTP_ADDR`: host dashboard bind address, default `127.0.0.1:8090`
 - `NS_CONFIG_JSON`: full namespace configuration list; if unset, built-in defaults are used
 
-The runtime base is fixed at `/var/lib/netforge`; it is not user-configurable.
+The scratch runtime base is fixed at `/var/lib/netforge`; it is not user-configurable.
+The persistent state base is fixed at `/data/netforge`; it is not user-configurable.
 
 Internal plugin/sandbox environment variables are implementation details and should not be turned into user-facing config unless that is an explicit feature change.
 
@@ -49,7 +50,8 @@ Internal plugin/sandbox environment variables are implementation details and sho
 
 - NetForge runs as root and performs destructive host network changes.
 - NetForge assumes exclusive ownership of the host's named namespace topology and the VLAN-backed structure described by its config.
-- The runtime base directory is security-sensitive. NetForge always uses `/var/lib/netforge`, and it must remain root-owned with `0700` permissions.
+- The runtime base directory is security-sensitive. NetForge always uses `/var/lib/netforge` for scratch runtime state, and it must remain root-owned with `0700` permissions.
+- The persistent state base is `/data/netforge`. Durable state like the SFTP jobs database and per-plugin data directories should live there so they survive appliance upgrades.
 - On startup, NetForge currently assumes ownership of all named network namespaces visible under `/run/netns`.
 - NetForge does not accept unrelated named namespaces or parallel namespace-management software outside its control.
 - Any named namespace on the host that is not represented in the active NetForge config will be removed, even if NetForge did not create it.

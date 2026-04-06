@@ -567,11 +567,12 @@ func TestHostDashboardServiceSFTPJobRoutes(t *testing.T) {
 	defer manager.Close()
 
 	service := &hostDashboardService{
-		addr:        "127.0.0.1:8090",
-		parentNIC:   "eth0",
-		runtimeBase: "/var/lib/netforge",
-		plugins:     plugins,
-		jobManager:  manager,
+		addr:           "127.0.0.1:8090",
+		parentNIC:      "eth0",
+		runtimeBase:    "/var/lib/netforge",
+		persistentBase: "/data/netforge",
+		plugins:        plugins,
+		jobManager:     manager,
 	}
 
 	createForm := url.Values{

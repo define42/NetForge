@@ -617,10 +617,11 @@ func TestRunHostReconcilesNamespacesAndStartsPlugins(t *testing.T) {
 	cfg.Gateway = ""
 
 	selfBinary := buildPackageBinary(t)
+	persistentBase := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runHost(ctx, parentName, selfBinary, runtimeBase, fmt.Sprintf("127.0.0.1:%d", hostPort), []NSConfig{cfg})
+		errCh <- runHost(ctx, parentName, selfBinary, runtimeBase, persistentBase, fmt.Sprintf("127.0.0.1:%d", hostPort), []NSConfig{cfg})
 	}()
 
 	waitForHTTP(t, func() (string, int, error) {
@@ -726,7 +727,8 @@ func TestRunHostCleansRecreatedNamespacesOnStartupFailure(t *testing.T) {
 	}
 
 	selfBinary := buildPackageBinary(t)
-	err = runHost(context.Background(), parentName, selfBinary, runtimeBase, fmt.Sprintf("127.0.0.1:%d", hostPort), []NSConfig{cfg1, cfg2})
+	persistentBase := t.TempDir()
+	err = runHost(context.Background(), parentName, selfBinary, runtimeBase, persistentBase, fmt.Sprintf("127.0.0.1:%d", hostPort), []NSConfig{cfg1, cfg2})
 	if err == nil {
 		t.Fatal("runHost succeeded, want error")
 	}

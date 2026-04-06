@@ -360,6 +360,11 @@ pre {
 <td><code>{{.RuntimeBase}}</code></td>
 <td>Runtime directory used by NetForge</td>
 </tr>
+<tr>
+<td><code>PERSISTENT_BASE</code></td>
+<td><code>{{.PersistentBase}}</code></td>
+<td>Persistent storage used for upgrade-safe NetForge state</td>
+</tr>
 </tbody>
 </table>
 </div>

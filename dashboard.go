@@ -46,6 +46,7 @@ type hostDashboardData struct {
 	HostHTTPAddr          string                  `json:"host_http_addr"`
 	ParentNIC             string                  `json:"parent_nic"`
 	RuntimeBase           string                  `json:"runtime_base"`
+	PersistentBase        string                  `json:"persistent_base"`
 	CurrentPage           string                  `json:"-"`
 	PageTitle             string                  `json:"-"`
 	PageDescription       string                  `json:"-"`
@@ -115,15 +116,16 @@ type hostSFTPResultView struct {
 }
 
 type hostDashboardService struct {
-	addr         string
-	parentNIC    string
-	runtimeBase  string
-	plugins      []*runningPlugin
-	jobManager   *sftpSyncJobManager
-	statsLookup  func(namespaceName, ifName string) (hostNICStatisticsView, error)
-	arpLookup    func(namespaceName, ifName string) ([]hostARPEntryView, error)
-	pingFunc     func(namespaceName, targetIP string) (string, error)
-	tcpCheckFunc func(namespaceName, targetIP string, port int) (string, error)
+	addr           string
+	parentNIC      string
+	runtimeBase    string
+	persistentBase string
+	plugins        []*runningPlugin
+	jobManager     *sftpSyncJobManager
+	statsLookup    func(namespaceName, ifName string) (hostNICStatisticsView, error)
+	arpLookup      func(namespaceName, ifName string) ([]hostARPEntryView, error)
+	pingFunc       func(namespaceName, targetIP string) (string, error)
+	tcpCheckFunc   func(namespaceName, targetIP string, port int) (string, error)
 }
 
 var dashboardSnapshotTaskTimeout = 750 * time.Millisecond
@@ -372,10 +374,11 @@ func (s *hostDashboardService) snapshotWithContext(ctx context.Context) hostDash
 	wg.Wait()
 
 	data := hostDashboardData{
-		HostHTTPAddr: s.addr,
-		ParentNIC:    s.parentNIC,
-		RuntimeBase:  s.runtimeBase,
-		Namespaces:   namespaces,
+		HostHTTPAddr:   s.addr,
+		ParentNIC:      s.parentNIC,
+		RuntimeBase:    s.runtimeBase,
+		PersistentBase: s.persistentBase,
+		Namespaces:     namespaces,
 	}
 	if s.jobManager != nil {
 		jobs, err := s.jobManager.Snapshot()
@@ -1043,13 +1046,14 @@ func checkCurrentNamespaceTCPPort(namespaceName, targetIP string, port int) (str
 	return fmt.Sprintf("tcp connect to %s from %s succeeded", addr, namespaceName), nil
 }
 
-func startHostDashboard(addr, parentNIC, runtimeBase string, plugins []*runningPlugin, jobManager *sftpSyncJobManager) (*http.Server, string, error) {
+func startHostDashboard(addr, parentNIC, runtimeBase, persistentBase string, plugins []*runningPlugin, jobManager *sftpSyncJobManager) (*http.Server, string, error) {
 	service := &hostDashboardService{
-		addr:        addr,
-		parentNIC:   parentNIC,
-		runtimeBase: runtimeBase,
-		plugins:     plugins,
-		jobManager:  jobManager,
+		addr:           addr,
+		parentNIC:      parentNIC,
+		runtimeBase:    runtimeBase,
+		persistentBase: persistentBase,
+		plugins:        plugins,
+		jobManager:     jobManager,
 	}
 
 	listener, err := net.Listen("tcp", addr)

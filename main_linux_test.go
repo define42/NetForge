@@ -706,7 +706,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 
 func TestStartHostDashboardAndRunHost(t *testing.T) {
 	t.Run("dashboard server", func(t *testing.T) {
-		server, addr, err := startHostDashboard("127.0.0.1:0", "eth0", "/var/lib/netforge", nil, nil)
+		server, addr, err := startHostDashboard("127.0.0.1:0", "eth0", "/var/lib/netforge", "/data/netforge", nil, nil)
 		if err != nil {
 			t.Fatalf("startHostDashboard failed: %v", err)
 		}
@@ -771,7 +771,7 @@ func TestStartHostDashboardAndRunHost(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		if err := runHost(ctx, "eth0", "/bin/true", t.TempDir(), "127.0.0.1:0", nil); err != nil {
+		if err := runHost(ctx, "eth0", "/bin/true", t.TempDir(), t.TempDir(), "127.0.0.1:0", nil); err != nil {
 			t.Fatalf("runHost failed: %v", err)
 		}
 	})
@@ -789,7 +789,9 @@ func TestNamespaceCmdRunnerHelpers(t *testing.T) {
 		namespace: "ns-helper",
 		sandbox: pluginSandboxSpec{
 			hostSocketDir:   "/host/plugin-dir",
+			hostDataDir:     "/host/plugin-data",
 			pluginSocketDir: pluginSandboxSocketDir,
+			pluginDataDir:   pluginSandboxDataDir,
 		},
 	}
 
@@ -999,9 +1001,10 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 	var tcpCheckCalls []string
 	var sftpListCalls []SFTPListRequest
 	service := &hostDashboardService{
-		addr:        "127.0.0.1:8090",
-		parentNIC:   "eth0",
-		runtimeBase: "/var/lib/netforge",
+		addr:           "127.0.0.1:8090",
+		parentNIC:      "eth0",
+		runtimeBase:    "/var/lib/netforge",
+		persistentBase: "/data/netforge",
 		statsLookup: func(namespaceName, ifName string) (hostNICStatisticsView, error) {
 			switch namespaceName {
 			case "ns1":
@@ -1197,9 +1200,11 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 			"HOST_HTTP_ADDR",
 			"PARENT_NIC",
 			"RUNTIME_BASE",
+			"PERSISTENT_BASE",
 			"127.0.0.1:8090",
 			"eth0",
 			"/var/lib/netforge",
+			"/data/netforge",
 			"name",
 			"vlan_id",
 			"if_name",
@@ -1240,6 +1245,9 @@ func TestHostDashboardServiceRoutes(t *testing.T) {
 		}
 		if payload.ParentNIC != "eth0" {
 			t.Fatalf("parent nic mismatch: got %q want %q", payload.ParentNIC, "eth0")
+		}
+		if payload.PersistentBase != "/data/netforge" {
+			t.Fatalf("persistent base mismatch: got %q want %q", payload.PersistentBase, "/data/netforge")
 		}
 		if len(payload.Namespaces) != 2 {
 			t.Fatalf("namespace count mismatch: got %d want %d", len(payload.Namespaces), 2)
@@ -1626,9 +1634,10 @@ func TestHostDashboardSnapshotTimeoutsArePerTaskAndPerNamespace(t *testing.T) {
 	defer close(blocker)
 
 	service := &hostDashboardService{
-		addr:        "127.0.0.1:8090",
-		parentNIC:   "eth0",
-		runtimeBase: "/var/lib/netforge",
+		addr:           "127.0.0.1:8090",
+		parentNIC:      "eth0",
+		runtimeBase:    "/var/lib/netforge",
+		persistentBase: "/data/netforge",
 		statsLookup: func(namespaceName, ifName string) (hostNICStatisticsView, error) {
 			if namespaceName == "stuck" {
 				<-blocker
@@ -2300,7 +2309,7 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 	}
 
 	bin := buildPackageBinary(t)
-	proc, err := startNamespacePlugin(bin, t.TempDir(), cfg)
+	proc, err := startNamespacePlugin(bin, t.TempDir(), t.TempDir(), cfg)
 	if err != nil {
 		t.Fatalf("startNamespacePlugin failed: %v", err)
 	}

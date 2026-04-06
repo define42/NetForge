@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -22,8 +21,11 @@ func envDefault(key, fallback string) string {
 	return fallback
 }
 
-func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAddr string, configs []NSConfig) (err error) {
+func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, persistentBase, hostHTTPAddr string, configs []NSConfig) (err error) {
 	if err := ensurePrivateOwnedDir(runtimeBase); err != nil {
+		return err
+	}
+	if err := ensurePrivateOwnedDir(persistentBase); err != nil {
 		return err
 	}
 
@@ -51,7 +53,7 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAd
 	}()
 
 	for _, cfg := range configs {
-		rp, err := startNamespacePlugin(selfBinary, runtimeBase, cfg)
+		rp, err := startNamespacePlugin(selfBinary, runtimeBase, persistentBase, cfg)
 		if err != nil {
 			return err
 		}
@@ -68,7 +70,7 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAd
 		log.Printf("namespace=%s message=%q http=%s running=%v", desc.Namespace, desc.Message, status.HTTPAddr, status.HTTPRunning)
 	}
 
-	jobManager, err := openSFTPSyncJobManager(filepath.Join(runtimeBase, sftpJobsDBFilename), func(namespace string) *runningPlugin {
+	jobManager, err := openSFTPSyncJobManager(persistentSFTPJobsDBPath(persistentBase), func(namespace string) *runningPlugin {
 		for _, plugin := range plugins {
 			if plugin != nil && plugin.cfg.Name == namespace {
 				return plugin
@@ -85,7 +87,7 @@ func runHost(ctx context.Context, parentNIC, selfBinary, runtimeBase, hostHTTPAd
 		}
 	}()
 
-	server, actualAddr, err := startHostDashboard(hostHTTPAddr, parentNIC, runtimeBase, plugins, jobManager)
+	server, actualAddr, err := startHostDashboard(hostHTTPAddr, parentNIC, runtimeBase, persistentBase, plugins, jobManager)
 	if err != nil {
 		return err
 	}
@@ -148,7 +150,7 @@ func runMain() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	return runHost(ctx, parentNIC, selfBinary, defaultPluginRuntimeBase, hostHTTPAddr, configs)
+	return runHost(ctx, parentNIC, selfBinary, defaultPluginRuntimeBase, defaultPersistentStateBase, hostHTTPAddr, configs)
 }
 
 func main() {

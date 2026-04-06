@@ -374,11 +374,21 @@ func startCmdInNamedNamespace(cmd *exec.Cmd, namespace string) (err error) {
 	return nil
 }
 
-func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runningPlugin, error) {
+func startNamespacePlugin(selfBinary, runtimeBase, persistentBase string, cfg NSConfig) (*runningPlugin, error) {
 	cfg = normalizeNSConfig(cfg)
 
 	runtimeDir := filepath.Join(runtimeBase, cfg.Name)
 	if err := ensurePrivateOwnedDir(runtimeDir); err != nil {
+		return nil, err
+	}
+	if err := ensurePrivateOwnedDir(persistentBase); err != nil {
+		return nil, err
+	}
+	if err := ensurePrivateOwnedDir(persistentPluginDataBase(persistentBase)); err != nil {
+		return nil, err
+	}
+	dataDir := persistentPluginDataDir(persistentBase, cfg.Name)
+	if err := ensurePluginDataDir(dataDir, pluginSandboxUID, pluginSandboxGID); err != nil {
 		return nil, err
 	}
 
@@ -397,7 +407,7 @@ func startNamespacePlugin(selfBinary, runtimeBase string, cfg NSConfig) (*runnin
 		HandshakeConfig: handshake,
 		Plugins:         pluginMap,
 		RunnerFunc: func(logger hclog.Logger, cmd *exec.Cmd, socketDir string) (runner.Runner, error) {
-			sandbox, err := newPluginSandboxSpec(runtimeDir, socketDir)
+			sandbox, err := newPluginSandboxSpec(runtimeDir, socketDir, dataDir)
 			if err != nil {
 				return nil, err
 			}

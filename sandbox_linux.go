@@ -23,13 +23,14 @@ const (
 	pluginSandboxGID = 65534
 
 	pluginSandboxSocketDir  = "/run/go-plugin"
+	pluginSandboxDataDir    = "/data"
 	pluginSandboxOldRootDir = "/.old-root"
 	pluginSandboxProcDir    = "/proc"
 	pluginSandboxTmpDir     = "/tmp"
 
 	envPluginSandboxRoot          = "NS_PLUGIN_SANDBOX_ROOT"
 	envPluginSandboxHostSocketDir = "NS_PLUGIN_SANDBOX_HOST_SOCKET_DIR"
-	envPluginSandboxSocketDir     = "NS_PLUGIN_SANDBOX_SOCKET_DIR"
+	envPluginSandboxHostDataDir   = "NS_PLUGIN_SANDBOX_HOST_DATA_DIR"
 	envPluginSandboxStage         = "NS_PLUGIN_SANDBOX_STAGE"
 	envPluginSandboxFailStep      = "NS_PLUGIN_SANDBOX_TEST_FAIL_STEP"
 	envPluginUnixSocketDir        = "PLUGIN_UNIX_SOCKET_DIR"
@@ -81,12 +82,14 @@ var (
 type pluginSandboxSpec struct {
 	rootDir         string
 	hostSocketDir   string
+	hostDataDir     string
 	pluginSocketDir string
+	pluginDataDir   string
 	uid             int
 	gid             int
 }
 
-func newPluginSandboxSpec(runtimeDir, hostSocketDir string) (pluginSandboxSpec, error) {
+func newPluginSandboxSpec(runtimeDir, hostSocketDir, hostDataDir string) (pluginSandboxSpec, error) {
 	rootDir, err := filepath.Abs(filepath.Join(runtimeDir, "sandbox-root"))
 	if err != nil {
 		return pluginSandboxSpec{}, fmt.Errorf("resolve sandbox root: %w", err)
@@ -96,11 +99,17 @@ func newPluginSandboxSpec(runtimeDir, hostSocketDir string) (pluginSandboxSpec, 
 	if err != nil {
 		return pluginSandboxSpec{}, fmt.Errorf("resolve sandbox socket dir: %w", err)
 	}
+	hostDataDir, err = filepath.Abs(hostDataDir)
+	if err != nil {
+		return pluginSandboxSpec{}, fmt.Errorf("resolve sandbox data dir: %w", err)
+	}
 
 	spec := pluginSandboxSpec{
 		rootDir:         filepath.Clean(rootDir),
 		hostSocketDir:   filepath.Clean(hostSocketDir),
+		hostDataDir:     filepath.Clean(hostDataDir),
 		pluginSocketDir: pluginSandboxSocketDir,
+		pluginDataDir:   pluginSandboxDataDir,
 		uid:             pluginSandboxUID,
 		gid:             pluginSandboxGID,
 	}
@@ -114,12 +123,11 @@ func loadPluginSandboxSpecFromEnv() (pluginSandboxSpec, error) {
 	spec := pluginSandboxSpec{
 		rootDir:         filepath.Clean(os.Getenv(envPluginSandboxRoot)),
 		hostSocketDir:   filepath.Clean(os.Getenv(envPluginSandboxHostSocketDir)),
-		pluginSocketDir: filepath.Clean(os.Getenv(envPluginSandboxSocketDir)),
+		hostDataDir:     filepath.Clean(os.Getenv(envPluginSandboxHostDataDir)),
+		pluginSocketDir: pluginSandboxSocketDir,
+		pluginDataDir:   pluginSandboxDataDir,
 		uid:             pluginSandboxUID,
 		gid:             pluginSandboxGID,
-	}
-	if spec.pluginSocketDir == "." || spec.pluginSocketDir == "" {
-		spec.pluginSocketDir = pluginSandboxSocketDir
 	}
 	if err := spec.validate(); err != nil {
 		return pluginSandboxSpec{}, err
@@ -137,10 +145,18 @@ func (s pluginSandboxSpec) validate() error {
 		return fmt.Errorf("%s is not set", envPluginSandboxHostSocketDir)
 	case !filepath.IsAbs(s.hostSocketDir):
 		return fmt.Errorf("sandbox host socket dir %q must be absolute", s.hostSocketDir)
+	case s.hostDataDir == "" || s.hostDataDir == ".":
+		return fmt.Errorf("%s is not set", envPluginSandboxHostDataDir)
+	case !filepath.IsAbs(s.hostDataDir):
+		return fmt.Errorf("sandbox host data dir %q must be absolute", s.hostDataDir)
 	case s.pluginSocketDir == "" || s.pluginSocketDir == ".":
 		return fmt.Errorf("sandbox plugin socket dir is empty")
 	case !filepath.IsAbs(s.pluginSocketDir):
 		return fmt.Errorf("sandbox plugin socket dir %q must be absolute", s.pluginSocketDir)
+	case s.pluginDataDir == "" || s.pluginDataDir == ".":
+		return fmt.Errorf("sandbox plugin data dir is empty")
+	case !filepath.IsAbs(s.pluginDataDir):
+		return fmt.Errorf("sandbox plugin data dir %q must be absolute", s.pluginDataDir)
 	case s.uid < 0 || s.gid < 0:
 		return fmt.Errorf("sandbox uid/gid must be non-negative")
 	default:
@@ -152,7 +168,7 @@ func (s pluginSandboxSpec) env() []string {
 	return []string{
 		envPluginSandboxRoot + "=" + s.rootDir,
 		envPluginSandboxHostSocketDir + "=" + s.hostSocketDir,
-		envPluginSandboxSocketDir + "=" + s.pluginSocketDir,
+		envPluginSandboxHostDataDir + "=" + s.hostDataDir,
 		envPluginSandboxStage + "=" + pluginSandboxStageBootstrap,
 	}
 }
@@ -279,6 +295,7 @@ func (s pluginSandboxSpec) prepareFilesystem() error {
 
 	for _, dir := range []string{
 		s.rootDir,
+		s.rootPath(s.pluginDataDir),
 		s.rootPath("/run"),
 		s.rootPath(s.pluginSocketDir),
 		s.rootPath(pluginSandboxProcDir),
@@ -303,6 +320,15 @@ func (s pluginSandboxSpec) prepareFilesystem() error {
 	}
 	if err := os.Chmod(s.rootPath(s.pluginSocketDir), 0o700); err != nil {
 		return fmt.Errorf("chmod sandbox socket dir: %w", err)
+	}
+	if err := pluginSandboxMount(s.hostDataDir, s.rootPath(s.pluginDataDir), "", uintptr(unix.MS_BIND), ""); err != nil {
+		return fmt.Errorf("bind mount sandbox data dir: %w", err)
+	}
+	if err := pluginSandboxChown(s.rootPath(s.pluginDataDir), s.uid, s.gid); err != nil {
+		return fmt.Errorf("chown sandbox data dir: %w", err)
+	}
+	if err := os.Chmod(s.rootPath(s.pluginDataDir), 0o700); err != nil {
+		return fmt.Errorf("chmod sandbox data dir: %w", err)
 	}
 
 	for _, mountPath := range pluginSandboxReadonlyBindMounts {

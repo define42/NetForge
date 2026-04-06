@@ -35,7 +35,9 @@ NetForge is destructive by design.
 - This includes namespaces NetForge did not create.
 - Manual changes inside a configured namespace are not preserved.
 - Namespace-local firewall changes are not preserved either; NetForge rewrites the managed firewall state.
-- The runtime base is security-sensitive. NetForge always uses `/var/lib/netforge`, and it must remain root-owned and `0700`.
+- The runtime base is security-sensitive. NetForge always uses `/var/lib/netforge` for scratch runtime state, and it must remain root-owned and `0700`.
+- NetForge keeps upgrade-safe persistent state under `/data/netforge`.
+- Persistent per-plugin data lives under `/data/netforge/plugin-data/<namespace>` and is bind-mounted into the plugin sandbox at `/data`.
 
 Do not run this on a host where unrelated named namespaces must survive.
 
@@ -87,7 +89,13 @@ The host process reads these environment variables:
 - `HOST_HTTP_ADDR`: host dashboard address. Default: `127.0.0.1:8090`
 - `NS_CONFIG_JSON`: JSON array of namespace configs. If unset, built-in demo defaults are used
 
-NetForge always uses `/var/lib/netforge` as its runtime base.
+NetForge always uses `/var/lib/netforge` as its scratch runtime base.
+
+NetForge always uses `/data/netforge` as its persistent state base.
+
+Each plugin also gets a persistent data directory mounted inside the sandbox at the fixed path `/data`. On the host, that maps to `/data/netforge/plugin-data/<namespace>`.
+
+The SFTP jobs database is also stored persistently at `/data/netforge/sftp-jobs.sqlite`.
 
 Example:
 
