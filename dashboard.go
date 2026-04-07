@@ -705,11 +705,13 @@ func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *htt
 	}
 
 	form := hostSFTPSyncJobFormData{
+		FromKind:      normalizeSFTPEndpointKind(r.FormValue("from_kind")),
 		FromNamespace: strings.TrimSpace(r.FormValue("from_namespace")),
 		FromHost:      strings.Trim(strings.TrimSpace(r.FormValue("from_host")), "[]"),
 		FromPort:      strings.TrimSpace(r.FormValue("from_port")),
 		FromUsername:  strings.TrimSpace(r.FormValue("from_username")),
 		FromDirectory: strings.TrimSpace(r.FormValue("from_directory")),
+		ToKind:        normalizeSFTPEndpointKind(r.FormValue("to_kind")),
 		ToNamespace:   strings.TrimSpace(r.FormValue("to_namespace")),
 		ToHost:        strings.Trim(strings.TrimSpace(r.FormValue("to_host")), "[]"),
 		ToPort:        strings.TrimSpace(r.FormValue("to_port")),
@@ -729,20 +731,6 @@ func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *htt
 		return
 	}
 
-	fromPort, err := strconv.Atoi(form.FromPort)
-	if err != nil || fromPort < 1 || fromPort > 65535 {
-		data.SFTPJobError = fmt.Sprintf("invalid source TCP port %q", form.FromPort)
-		s.renderPage(w, data)
-		return
-	}
-
-	toPort, err := strconv.Atoi(form.ToPort)
-	if err != nil || toPort < 1 || toPort > 65535 {
-		data.SFTPJobError = fmt.Sprintf("invalid destination TCP port %q", form.ToPort)
-		s.renderPage(w, data)
-		return
-	}
-
 	interval, err := parseDashboardJobInterval(form.Interval)
 	if err != nil {
 		data.SFTPJobError = err.Error()
@@ -750,8 +738,29 @@ func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *htt
 		return
 	}
 
+	fromPort := 0
+	if form.FromKind == sftpEndpointKindClient {
+		fromPort, err = strconv.Atoi(form.FromPort)
+		if err != nil || fromPort < 1 || fromPort > 65535 {
+			data.SFTPJobError = fmt.Sprintf("invalid source TCP port %q", form.FromPort)
+			s.renderPage(w, data)
+			return
+		}
+	}
+
+	toPort := 0
+	if form.ToKind == sftpEndpointKindClient {
+		toPort, err = strconv.Atoi(form.ToPort)
+		if err != nil || toPort < 1 || toPort > 65535 {
+			data.SFTPJobError = fmt.Sprintf("invalid destination TCP port %q", form.ToPort)
+			s.renderPage(w, data)
+			return
+		}
+	}
+
 	job, err := s.jobManager.CreateJob(sftpSyncJobSpec{
 		From: sftpEndpointConfig{
+			Kind:      form.FromKind,
 			Namespace: form.FromNamespace,
 			Host:      form.FromHost,
 			Port:      fromPort,
@@ -760,6 +769,7 @@ func (s *hostDashboardService) handleCreateSFTPJob(w http.ResponseWriter, r *htt
 			Directory: form.FromDirectory,
 		},
 		To: sftpEndpointConfig{
+			Kind:      form.ToKind,
 			Namespace: form.ToNamespace,
 			Host:      form.ToHost,
 			Port:      toPort,

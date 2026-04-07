@@ -607,6 +607,445 @@ func TestHostDashboardServiceSFTPJobRoutes(t *testing.T) {
 	}
 }
 
+func TestSFTPSyncJobManagerEmbeddedEndpointKinds(t *testing.T) {
+	type ensureCall struct {
+		namespace string
+		req       EnsureNamespaceSFTPUserRequest
+	}
+	type removeCall struct {
+		namespace string
+		req       RemoveNamespaceSFTPUserRequest
+	}
+
+	testCases := []struct {
+		name              string
+		from              sftpEndpointConfig
+		to                sftpEndpointConfig
+		wantCreateEnsures []ensureCall
+		wantDownloadAddr  string
+		wantDownloadDir   string
+		wantUploadAddr    string
+		wantUploadDir     string
+		wantDeleteRemoves []removeCall
+	}{
+		{
+			name: "client to embedded server",
+			from: sftpEndpointConfig{
+				Kind:      sftpEndpointKindClient,
+				Namespace: "srcns",
+				Host:      "10.0.0.1",
+				Port:      22,
+				Username:  "source",
+				Password:  "source-pass",
+				Directory: "/from",
+			},
+			to: sftpEndpointConfig{
+				Kind:      sftpEndpointKindServer,
+				Namespace: "dstns",
+				Username:  "dest-user",
+				Password:  "dest-pass",
+			},
+			wantCreateEnsures: []ensureCall{
+				{
+					namespace: "dstns",
+					req: EnsureNamespaceSFTPUserRequest{
+						Username: "dest-user",
+						Password: "dest-pass",
+						Root:     "/data/sftp-endpoints/1/destination",
+						CanRead:  true,
+						CanWrite: true,
+					},
+				},
+			},
+			wantDownloadAddr: "10.0.0.1:22",
+			wantDownloadDir:  "/from",
+			wantUploadAddr:   "127.0.0.1:2222",
+			wantUploadDir:    "/",
+			wantDeleteRemoves: []removeCall{
+				{namespace: "dstns", req: RemoveNamespaceSFTPUserRequest{Username: "dest-user"}},
+			},
+		},
+		{
+			name: "embedded server to client",
+			from: sftpEndpointConfig{
+				Kind:      sftpEndpointKindServer,
+				Namespace: "srcns",
+				Username:  "source-user",
+				Password:  "source-pass",
+			},
+			to: sftpEndpointConfig{
+				Kind:      sftpEndpointKindClient,
+				Namespace: "dstns",
+				Host:      "10.0.0.2",
+				Port:      2022,
+				Username:  "dest",
+				Password:  "dest-pass",
+				Directory: "/archive",
+			},
+			wantCreateEnsures: []ensureCall{
+				{
+					namespace: "srcns",
+					req: EnsureNamespaceSFTPUserRequest{
+						Username: "source-user",
+						Password: "source-pass",
+						Root:     "/data/sftp-endpoints/1/source",
+						CanRead:  true,
+						CanWrite: true,
+					},
+				},
+			},
+			wantDownloadAddr: "127.0.0.1:2222",
+			wantDownloadDir:  "/",
+			wantUploadAddr:   "10.0.0.2:2022",
+			wantUploadDir:    "/archive",
+			wantDeleteRemoves: []removeCall{
+				{namespace: "srcns", req: RemoveNamespaceSFTPUserRequest{Username: "source-user"}},
+			},
+		},
+		{
+			name: "embedded server to embedded server",
+			from: sftpEndpointConfig{
+				Kind:      sftpEndpointKindServer,
+				Namespace: "srcns",
+				Username:  "source-user",
+				Password:  "source-pass",
+			},
+			to: sftpEndpointConfig{
+				Kind:      sftpEndpointKindServer,
+				Namespace: "dstns",
+				Username:  "dest-user",
+				Password:  "dest-pass",
+			},
+			wantCreateEnsures: []ensureCall{
+				{
+					namespace: "srcns",
+					req: EnsureNamespaceSFTPUserRequest{
+						Username: "source-user",
+						Password: "source-pass",
+						Root:     "/data/sftp-endpoints/1/source",
+						CanRead:  true,
+						CanWrite: true,
+					},
+				},
+				{
+					namespace: "dstns",
+					req: EnsureNamespaceSFTPUserRequest{
+						Username: "dest-user",
+						Password: "dest-pass",
+						Root:     "/data/sftp-endpoints/1/destination",
+						CanRead:  true,
+						CanWrite: true,
+					},
+				},
+			},
+			wantDownloadAddr: "127.0.0.1:2222",
+			wantDownloadDir:  "/",
+			wantUploadAddr:   "127.0.0.1:2222",
+			wantUploadDir:    "/",
+			wantDeleteRemoves: []removeCall{
+				{namespace: "srcns", req: RemoveNamespaceSFTPUserRequest{Username: "source-user"}},
+				{namespace: "dstns", req: RemoveNamespaceSFTPUserRequest{Username: "dest-user"}},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			persistentBase := t.TempDir()
+			dbPath := filepath.Join(persistentBase, sftpJobsDBFilename)
+
+			var (
+				mu             sync.Mutex
+				ensureCalls    []ensureCall
+				removeCalls    []removeCall
+				downloadStarts []StartSFTPStageDownloadRequest
+				uploadStarts   []StartSFTPStageUploadRequest
+			)
+
+			sourceRPC := &stubNamespaceService{
+				ensureSFTPUserHook: func(req EnsureNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					ensureCalls = append(ensureCalls, ensureCall{namespace: "srcns", req: req})
+					return &NamespaceSFTPUserStatusResponse{Username: req.Username, Exists: true, Root: req.Root, CanRead: req.CanRead, CanWrite: req.CanWrite}, nil
+				},
+				removeSFTPUserHook: func(req RemoveNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					removeCalls = append(removeCalls, removeCall{namespace: "srcns", req: req})
+					return &NamespaceSFTPUserStatusResponse{Username: req.Username}, nil
+				},
+				stageDownloadStartHook: func(req StartSFTPStageDownloadRequest) (*SFTPStageWorkerStatus, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					downloadStarts = append(downloadStarts, req)
+					return &SFTPStageWorkerStatus{JobID: req.JobID, Running: true}, nil
+				},
+				stageDownloadStatusHook: func(jobID int64) (*SFTPStageWorkerStatus, error) {
+					return &SFTPStageWorkerStatus{JobID: jobID, Running: true}, nil
+				},
+			}
+			destinationRPC := &stubNamespaceService{
+				ensureSFTPUserHook: func(req EnsureNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					ensureCalls = append(ensureCalls, ensureCall{namespace: "dstns", req: req})
+					return &NamespaceSFTPUserStatusResponse{Username: req.Username, Exists: true, Root: req.Root, CanRead: req.CanRead, CanWrite: req.CanWrite}, nil
+				},
+				removeSFTPUserHook: func(req RemoveNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					removeCalls = append(removeCalls, removeCall{namespace: "dstns", req: req})
+					return &NamespaceSFTPUserStatusResponse{Username: req.Username}, nil
+				},
+				stageUploadStartHook: func(req StartSFTPStageUploadRequest) (*SFTPStageWorkerStatus, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					uploadStarts = append(uploadStarts, req)
+					return &SFTPStageWorkerStatus{JobID: req.JobID, Running: true}, nil
+				},
+				stageUploadStatusHook: func(jobID int64) (*SFTPStageWorkerStatus, error) {
+					return &SFTPStageWorkerStatus{JobID: jobID, Running: true}, nil
+				},
+			}
+
+			plugins := []*runningPlugin{
+				{cfg: NSConfig{Name: "srcns"}, rpc: sourceRPC},
+				{cfg: NSConfig{Name: "dstns"}, rpc: destinationRPC},
+			}
+			manager, err := openSFTPSyncJobManager(dbPath, func(namespace string) *runningPlugin {
+				for _, plugin := range plugins {
+					if plugin.cfg.Name == namespace {
+						return plugin
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("openSFTPSyncJobManager failed: %v", err)
+			}
+			defer manager.Close()
+
+			job, err := manager.CreateJob(sftpSyncJobSpec{
+				From:     tc.from,
+				To:       tc.to,
+				Interval: 5 * time.Minute,
+			})
+			if err != nil {
+				t.Fatalf("CreateJob failed: %v", err)
+			}
+
+			mu.Lock()
+			gotCreateEnsures := append([]ensureCall(nil), ensureCalls...)
+			ensureCalls = nil
+			mu.Unlock()
+			if len(gotCreateEnsures) != len(tc.wantCreateEnsures) {
+				t.Fatalf("unexpected create ensure count: got %+v want %+v", gotCreateEnsures, tc.wantCreateEnsures)
+			}
+			for i := range tc.wantCreateEnsures {
+				if gotCreateEnsures[i].namespace != tc.wantCreateEnsures[i].namespace || gotCreateEnsures[i].req != tc.wantCreateEnsures[i].req {
+					t.Fatalf("unexpected create ensure call %d: got %+v want %+v", i, gotCreateEnsures[i], tc.wantCreateEnsures[i])
+				}
+			}
+
+			if _, err := manager.StartJob(job.ID); err != nil {
+				t.Fatalf("StartJob failed: %v", err)
+			}
+
+			mu.Lock()
+			gotDownloadStarts := append([]StartSFTPStageDownloadRequest(nil), downloadStarts...)
+			gotUploadStarts := append([]StartSFTPStageUploadRequest(nil), uploadStarts...)
+			gotStopRemoves := append([]removeCall(nil), removeCalls...)
+			mu.Unlock()
+
+			if len(gotDownloadStarts) != 1 || gotDownloadStarts[0].Connection.Address != tc.wantDownloadAddr || gotDownloadStarts[0].RemoteDirectory != tc.wantDownloadDir {
+				t.Fatalf("unexpected download stage request: %+v", gotDownloadStarts)
+			}
+			if len(gotUploadStarts) != 1 || gotUploadStarts[0].Connection.Address != tc.wantUploadAddr || gotUploadStarts[0].RemoteDirectory != tc.wantUploadDir {
+				t.Fatalf("unexpected upload stage request: %+v", gotUploadStarts)
+			}
+			if len(gotStopRemoves) != 0 {
+				t.Fatalf("expected no embedded-user removals before stop, got %+v", gotStopRemoves)
+			}
+
+			if _, err := manager.StopJob(job.ID); err != nil {
+				t.Fatalf("StopJob failed: %v", err)
+			}
+
+			mu.Lock()
+			gotStopRemoves = append([]removeCall(nil), removeCalls...)
+			mu.Unlock()
+			if len(gotStopRemoves) != 0 {
+				t.Fatalf("expected stop to leave embedded users intact, got %+v", gotStopRemoves)
+			}
+
+			if tc.from.usesEmbeddedSFTPServer() {
+				if err := os.MkdirAll(manager.sourceEndpointRoot(*job), 0o755); err != nil {
+					t.Fatalf("MkdirAll source endpoint root failed: %v", err)
+				}
+			}
+			if tc.to.usesEmbeddedSFTPServer() {
+				if err := os.MkdirAll(manager.destinationEndpointRoot(*job), 0o755); err != nil {
+					t.Fatalf("MkdirAll destination endpoint root failed: %v", err)
+				}
+			}
+
+			if _, err := manager.DeleteJob(job.ID); err != nil {
+				t.Fatalf("DeleteJob failed: %v", err)
+			}
+
+			mu.Lock()
+			gotDeleteRemoves := append([]removeCall(nil), removeCalls...)
+			mu.Unlock()
+			if len(gotDeleteRemoves) != len(tc.wantDeleteRemoves) {
+				t.Fatalf("unexpected delete remove count: got %+v want %+v", gotDeleteRemoves, tc.wantDeleteRemoves)
+			}
+			for i := range tc.wantDeleteRemoves {
+				if gotDeleteRemoves[i] != tc.wantDeleteRemoves[i] {
+					t.Fatalf("unexpected delete remove call %d: got %+v want %+v", i, gotDeleteRemoves[i], tc.wantDeleteRemoves[i])
+				}
+			}
+			if tc.from.usesEmbeddedSFTPServer() {
+				if _, err := os.Stat(manager.sourceEndpointRoot(*job)); !os.IsNotExist(err) {
+					t.Fatalf("expected source endpoint root removal, got %v", err)
+				}
+			}
+			if tc.to.usesEmbeddedSFTPServer() {
+				if _, err := os.Stat(manager.destinationEndpointRoot(*job)); !os.IsNotExist(err) {
+					t.Fatalf("expected destination endpoint root removal, got %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestSFTPSyncJobManagerRejectsDuplicateEmbeddedSFTPUsers(t *testing.T) {
+	persistentBase := t.TempDir()
+	dbPath := filepath.Join(persistentBase, sftpJobsDBFilename)
+
+	plugins := []*runningPlugin{
+		{cfg: NSConfig{Name: "srcns"}, rpc: &stubNamespaceService{}},
+		{cfg: NSConfig{Name: "dstns"}, rpc: &stubNamespaceService{}},
+	}
+	manager, err := openSFTPSyncJobManager(dbPath, func(namespace string) *runningPlugin {
+		for _, plugin := range plugins {
+			if plugin.cfg.Name == namespace {
+				return plugin
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("openSFTPSyncJobManager failed: %v", err)
+	}
+	defer manager.Close()
+
+	if _, err := manager.CreateJob(sftpSyncJobSpec{
+		From: sftpEndpointConfig{
+			Kind:      sftpEndpointKindClient,
+			Namespace: "srcns",
+			Host:      "10.0.0.1",
+			Port:      22,
+			Username:  "source",
+			Password:  "source-pass",
+			Directory: "/from",
+		},
+		To: sftpEndpointConfig{
+			Kind:      sftpEndpointKindServer,
+			Namespace: "dstns",
+			Username:  "shared-user",
+			Password:  "dest-pass",
+		},
+		Interval: 5 * time.Minute,
+	}); err != nil {
+		t.Fatalf("initial CreateJob failed: %v", err)
+	}
+
+	_, err = manager.CreateJob(sftpSyncJobSpec{
+		From: sftpEndpointConfig{
+			Kind:      sftpEndpointKindClient,
+			Namespace: "srcns",
+			Host:      "10.0.0.3",
+			Port:      22,
+			Username:  "source-2",
+			Password:  "source-pass-2",
+			Directory: "/from-2",
+		},
+		To: sftpEndpointConfig{
+			Kind:      sftpEndpointKindServer,
+			Namespace: "dstns",
+			Username:  "shared-user",
+			Password:  "dest-pass-2",
+		},
+		Interval: 10 * time.Minute,
+	})
+	if err == nil || !strings.Contains(err.Error(), "already used") {
+		t.Fatalf("expected duplicate embedded-user validation error, got %v", err)
+	}
+}
+
+func TestHostDashboardServiceSFTPServerJobRoute(t *testing.T) {
+	persistentBase := t.TempDir()
+	dbPath := filepath.Join(persistentBase, sftpJobsDBFilename)
+
+	sourceRPC := &stubNamespaceService{}
+	destinationRPC := &stubNamespaceService{}
+	plugins := []*runningPlugin{
+		{cfg: NSConfig{Name: "srcns"}, rpc: sourceRPC},
+		{cfg: NSConfig{Name: "dstns"}, rpc: destinationRPC},
+	}
+	manager, err := openSFTPSyncJobManager(dbPath, func(namespace string) *runningPlugin {
+		for _, plugin := range plugins {
+			if plugin.cfg.Name == namespace {
+				return plugin
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("openSFTPSyncJobManager failed: %v", err)
+	}
+	defer manager.Close()
+
+	service := &hostDashboardService{
+		addr:           "127.0.0.1:8090",
+		parentNIC:      "eth0",
+		runtimeBase:    "/var/lib/netforge",
+		persistentBase: persistentBase,
+		plugins:        plugins,
+		jobManager:     manager,
+	}
+
+	createForm := url.Values{
+		"from_kind":      {"sftpserver"},
+		"from_namespace": {"srcns"},
+		"from_username":  {"source-user"},
+		"from_password":  {"source-pass"},
+		"to_kind":        {"sftpserver"},
+		"to_namespace":   {"dstns"},
+		"to_username":    {"dest-user"},
+		"to_password":    {"dest-pass"},
+		"interval":       {"30m"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/sftp-jobs/create", strings.NewReader(createForm.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	service.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected create status code: got %d want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Created SFTP sync job #1", "sftpserver", "127.0.0.1:2222", "<code>/</code>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected create body to contain %q, got %s", want, body)
+		}
+	}
+	if strings.Contains(body, "source-pass") || strings.Contains(body, "dest-pass") {
+		t.Fatalf("sftpserver job create response leaked password: %s", body)
+	}
+}
+
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
 

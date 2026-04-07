@@ -29,6 +29,13 @@ const (
 	sftpLocalStageDefaultFileMode = 0o600
 )
 
+var (
+	shouldNormalizeLocalStageOwnership = func() bool {
+		return os.Geteuid() == 0
+	}
+	chownLocalStagePath = os.Chown
+)
+
 type sftpStageWorkerStatusState struct {
 	mu            sync.Mutex
 	jobID         int64
@@ -336,6 +343,68 @@ func writeLocalStageMarker(finalPath, tmpPath string) error {
 	return writeLocalStageFileFromReader(finalPath, tmpPath, sftpLocalStageDefaultFileMode, strings.NewReader(""))
 }
 
+func normalizeLocalStageOwnership(root, target string, uid, gid int) error {
+	if uid < 0 || gid < 0 || !shouldNormalizeLocalStageOwnership() {
+		return nil
+	}
+
+	root = filepath.Clean(root)
+	target = filepath.Clean(target)
+	if target == "." || target == "" {
+		return nil
+	}
+
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return fmt.Errorf("resolve ownership path %q relative to %q: %w", target, root, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("ownership path %q escapes root %q", target, root)
+	}
+
+	current := target
+	for {
+		if err := chownLocalStagePath(current, uid, gid); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("chown stage path %q to %d:%d: %w", current, uid, gid, err)
+		}
+		if current == root {
+			return nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+func repairLocalStageTreeOwnership(root string, uid, gid int) error {
+	if uid < 0 || gid < 0 || !shouldNormalizeLocalStageOwnership() {
+		return nil
+	}
+
+	info, err := os.Stat(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat stage root %q for ownership repair: %w", root, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("stage root %q is not a directory", root)
+	}
+
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := chownLocalStagePath(path, uid, gid); err != nil {
+			return fmt.Errorf("chown stage path %q to %d:%d: %w", path, uid, gid, err)
+		}
+		return nil
+	})
+}
+
 func uploadLocalStageFile(client namespaceSFTPClient, localPath, remotePath string, mode os.FileMode) error {
 	localFile, err := os.Open(localPath)
 	if err != nil {
@@ -504,6 +573,13 @@ func runHostSFTPStageBridgeCycle(sourceIncomingDir, destinationIncomingDir, dest
 		return sftpBridgeCycleResult{CompletedFiles: completed}, err
 	}
 
+	if err := repairLocalStageTreeOwnership(destinationIncomingDir, pluginSandboxUID, pluginSandboxGID); err != nil {
+		return sftpBridgeCycleResult{CompletedFiles: completed}, fmt.Errorf("repair destination incoming ownership: %w", err)
+	}
+	if err := repairLocalStageTreeOwnership(destinationTmpDir, pluginSandboxUID, pluginSandboxGID); err != nil {
+		return sftpBridgeCycleResult{CompletedFiles: completed}, fmt.Errorf("repair destination tmp ownership: %w", err)
+	}
+
 	copied, err := copySourceStageToDestinationStage(sourceIncomingDir, destinationIncomingDir, destinationTmpDir, destinationAckDir)
 	if err != nil {
 		return sftpBridgeCycleResult{CompletedFiles: completed, CopiedFiles: copied}, err
@@ -562,6 +638,12 @@ func copySourceStageToDestinationStage(sourceIncomingDir, destinationIncomingDir
 			file.Mode,
 		); err != nil {
 			return copied, fmt.Errorf("copy staged file %q into destination queue: %w", file.AbsPath, err)
+		}
+		if err := normalizeLocalStageOwnership(destinationIncomingDir, destinationPath, pluginSandboxUID, pluginSandboxGID); err != nil {
+			return copied, fmt.Errorf("normalize destination staged file ownership for %q: %w", destinationPath, err)
+		}
+		if err := normalizeLocalStageOwnership(destinationTmpDir, filepath.Dir(sftpStageTempLocalPath(destinationTmpDir, file.RelPath)), pluginSandboxUID, pluginSandboxGID); err != nil {
+			return copied, fmt.Errorf("normalize destination tmp ownership for %q: %w", file.RelPath, err)
 		}
 		copied++
 	}

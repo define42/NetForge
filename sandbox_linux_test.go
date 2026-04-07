@@ -364,6 +364,15 @@ func TestPluginSandboxSeccompFilterAllowsNetworkingAndBlocksExecve(t *testing.T)
 	}
 }
 
+func TestPluginSandboxSeccompFilterAllowsWriteAt(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestSandboxHelperProcess$")
+	cmd.Env = append(os.Environ(), "NETFORGE_SANDBOX_HELPER=seccomp-writeat")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("seccomp writeat helper failed: %v\n%s", err, output)
+	}
+}
+
 func TestEnsurePluginSandboxRejectsUnknownStage(t *testing.T) {
 	t.Setenv(envPluginSandboxRoot, t.TempDir())
 	t.Setenv(envPluginSandboxHostSocketDir, t.TempDir())
@@ -754,6 +763,26 @@ func TestSandboxHelperProcess(t *testing.T) {
 		}
 		if err == nil {
 			err = clearCapabilitySets()
+		}
+	case "seccomp-writeat":
+		var tempDir string
+		tempDir, err = os.MkdirTemp("", "netforge-seccomp-writeat")
+		if err == nil {
+			defer os.RemoveAll(tempDir)
+		}
+		if err == nil {
+			err = pluginSandboxLoadFilter(pluginSandboxSeccompFilter())
+		}
+		if err == nil {
+			var f *os.File
+			f, err = os.OpenFile(filepath.Join(tempDir, "probe"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+			if err == nil {
+				if _, err = f.WriteAt([]byte("probe"), 0); err == nil {
+					err = f.Close()
+				} else {
+					_ = f.Close()
+				}
+			}
 		}
 	default:
 		err = fmt.Errorf("unknown helper mode %q", mode)

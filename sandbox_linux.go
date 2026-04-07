@@ -552,6 +552,7 @@ func pluginSandboxSeccompFilter() seccomp.Filter {
 						"poll",
 						"ppoll",
 						"pread64",
+						"pwrite64",
 						"prlimit64",
 						"pselect6",
 						"read",
@@ -678,6 +679,19 @@ func runPluginSandboxSeccompProbe() error {
 	}
 	if err := os.Remove(renameTarget); err != nil {
 		return fmt.Errorf("cleanup rename probe target failed: %w", err)
+	}
+
+	writeAtProbe := filepath.Join(socketDir, "writeat-probe")
+	probeFile, err := os.OpenFile(writeAtProbe, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open writeat probe failed: %w", err)
+	}
+	if _, err := probeFile.WriteAt([]byte("probe"), 0); err != nil {
+		_ = probeFile.Close()
+		return fmt.Errorf("writeat after seccomp failed: %w", err)
+	}
+	if err := probeFile.Close(); err != nil {
+		return fmt.Errorf("close writeat probe failed: %w", err)
 	}
 
 	if err := pluginSandboxProbeListenAndDial("tcp", "127.0.0.1:0"); err != nil {

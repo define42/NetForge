@@ -177,6 +177,30 @@ type SFTPStageWorkerStatus struct {
 	TotalFiles    int    `json:"total_files"`
 }
 
+type EnsureNamespaceSFTPUserRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password,omitempty"`
+	Root     string `json:"root"`
+	CanRead  bool   `json:"can_read"`
+	CanWrite bool   `json:"can_write"`
+}
+
+type RemoveNamespaceSFTPUserRequest struct {
+	Username string `json:"username"`
+}
+
+type NamespaceSFTPUserStatusRequest struct {
+	Username string `json:"username"`
+}
+
+type NamespaceSFTPUserStatusResponse struct {
+	Username string `json:"username"`
+	Exists   bool   `json:"exists"`
+	Root     string `json:"root,omitempty"`
+	CanRead  bool   `json:"can_read,omitempty"`
+	CanWrite bool   `json:"can_write,omitempty"`
+}
+
 type StatusResponse struct {
 	Namespace   string
 	Interface   string
@@ -208,6 +232,9 @@ type NamespaceService interface {
 	StartSFTPStageUpload(req StartSFTPStageUploadRequest) (*SFTPStageWorkerStatus, error)
 	StopSFTPStageUpload(jobID int64) (*SFTPStageWorkerStatus, error)
 	GetSFTPStageUploadStatus(jobID int64) (*SFTPStageWorkerStatus, error)
+	EnsureNamespaceSFTPUser(req EnsureNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error)
+	RemoveNamespaceSFTPUser(req RemoveNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error)
+	GetNamespaceSFTPUserStatus(req NamespaceSFTPUserStatusRequest) (*NamespaceSFTPUserStatusResponse, error)
 	StopHTTP() error
 	StopSFTP() error
 	Status() (*StatusResponse, error)
@@ -384,6 +411,33 @@ func (s *namespaceServiceRPCServer) GetSFTPStageUploadStatus(jobID int64, resp *
 	return nil
 }
 
+func (s *namespaceServiceRPCServer) EnsureNamespaceSFTPUser(req EnsureNamespaceSFTPUserRequest, resp *NamespaceSFTPUserStatusResponse) error {
+	out, err := s.Impl.EnsureNamespaceSFTPUser(req)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) RemoveNamespaceSFTPUser(req RemoveNamespaceSFTPUserRequest, resp *NamespaceSFTPUserStatusResponse) error {
+	out, err := s.Impl.RemoveNamespaceSFTPUser(req)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
+func (s *namespaceServiceRPCServer) GetNamespaceSFTPUserStatus(req NamespaceSFTPUserStatusRequest, resp *NamespaceSFTPUserStatusResponse) error {
+	out, err := s.Impl.GetNamespaceSFTPUserStatus(req)
+	if err != nil {
+		return err
+	}
+	*resp = *out
+	return nil
+}
+
 func (s *namespaceServiceRPCServer) StopHTTP(_ struct{}, _ *struct{}) error {
 	return s.Impl.StopHTTP()
 }
@@ -498,6 +552,24 @@ func (c *namespaceServiceRPCClient) StopSFTPStageUpload(jobID int64) (*SFTPStage
 func (c *namespaceServiceRPCClient) GetSFTPStageUploadStatus(jobID int64) (*SFTPStageWorkerStatus, error) {
 	var out SFTPStageWorkerStatus
 	err := c.client.Call("Plugin.GetSFTPStageUploadStatus", jobID, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) EnsureNamespaceSFTPUser(req EnsureNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	var out NamespaceSFTPUserStatusResponse
+	err := c.client.Call("Plugin.EnsureNamespaceSFTPUser", req, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) RemoveNamespaceSFTPUser(req RemoveNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	var out NamespaceSFTPUserStatusResponse
+	err := c.client.Call("Plugin.RemoveNamespaceSFTPUser", req, &out)
+	return &out, err
+}
+
+func (c *namespaceServiceRPCClient) GetNamespaceSFTPUserStatus(req NamespaceSFTPUserStatusRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	var out NamespaceSFTPUserStatusResponse
+	err := c.client.Call("Plugin.GetNamespaceSFTPUserStatus", req, &out)
 	return &out, err
 }
 

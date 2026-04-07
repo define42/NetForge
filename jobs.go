@@ -23,7 +23,18 @@ const sftpJobsDBFilename = "sftp-jobs.sqlite"
 
 var sftpSyncChunkSize = defaultSFTPChunkBytes
 
+const (
+	sftpEndpointKindClient      = "sftp_client"
+	sftpEndpointKindServer      = "sftpserver"
+	sftpEndpointDisplayClient   = "sftp-client"
+	sftpEmbeddedServerHost      = "127.0.0.1"
+	sftpEndpointRoleSource      = "source"
+	sftpEndpointRoleDestination = "destination"
+	sftpEndpointRootsDirName    = "sftp-endpoints"
+)
+
 type sftpEndpointConfig struct {
+	Kind      string
 	Namespace string
 	Host      string
 	Port      int
@@ -33,12 +44,38 @@ type sftpEndpointConfig struct {
 }
 
 func (c sftpEndpointConfig) connectionInfo() SFTPConnectionInfo {
+	if c.usesEmbeddedSFTPServer() {
+		return SFTPConnectionInfo{
+			Address:               net.JoinHostPort(sftpEmbeddedServerHost, strconv.Itoa(pluginSFTPPort)),
+			Username:              c.Username,
+			Password:              c.Password,
+			InsecureIgnoreHostKey: true,
+		}
+	}
 	return SFTPConnectionInfo{
 		Address:               net.JoinHostPort(c.Host, strconv.Itoa(c.Port)),
 		Username:              c.Username,
 		Password:              c.Password,
 		InsecureIgnoreHostKey: true,
 	}
+}
+
+func (c sftpEndpointConfig) usesEmbeddedSFTPServer() bool {
+	return c.Kind == sftpEndpointKindServer
+}
+
+func (c sftpEndpointConfig) effectiveDirectory() string {
+	if c.usesEmbeddedSFTPServer() {
+		return "/"
+	}
+	return normalizeSFTPDirectory(c.Directory)
+}
+
+func (c sftpEndpointConfig) displayKind() string {
+	if c.Kind == sftpEndpointKindServer {
+		return sftpEndpointKindServer
+	}
+	return sftpEndpointDisplayClient
 }
 
 type sftpSyncJobSpec struct {
@@ -65,10 +102,12 @@ type sftpSyncJob struct {
 type hostSFTPSyncJobView struct {
 	ID                            int64  `json:"id"`
 	FromNamespace                 string `json:"from_namespace"`
+	FromKind                      string `json:"from_kind"`
 	FromAddress                   string `json:"from_address"`
 	FromUsername                  string `json:"from_username"`
 	FromDirectory                 string `json:"from_directory"`
 	ToNamespace                   string `json:"to_namespace"`
+	ToKind                        string `json:"to_kind"`
 	ToAddress                     string `json:"to_address"`
 	ToUsername                    string `json:"to_username"`
 	ToDirectory                   string `json:"to_directory"`
@@ -95,11 +134,13 @@ type hostSFTPSyncJobView struct {
 }
 
 type hostSFTPSyncJobFormData struct {
+	FromKind      string `json:"from_kind,omitempty"`
 	FromNamespace string `json:"from_namespace,omitempty"`
 	FromHost      string `json:"from_host,omitempty"`
 	FromPort      string `json:"from_port,omitempty"`
 	FromUsername  string `json:"from_username,omitempty"`
 	FromDirectory string `json:"from_directory,omitempty"`
+	ToKind        string `json:"to_kind,omitempty"`
 	ToNamespace   string `json:"to_namespace,omitempty"`
 	ToHost        string `json:"to_host,omitempty"`
 	ToPort        string `json:"to_port,omitempty"`
@@ -145,12 +186,14 @@ func openSFTPSyncJobManager(dbPath string, pluginForNamespace func(string) *runn
 CREATE TABLE IF NOT EXISTS sftp_sync_jobs (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	from_namespace TEXT NOT NULL,
+	from_kind TEXT NOT NULL DEFAULT 'sftp_client',
 	from_host TEXT NOT NULL,
 	from_port INTEGER NOT NULL,
 	from_username TEXT NOT NULL,
 	from_password TEXT NOT NULL,
 	from_directory TEXT NOT NULL,
 	to_namespace TEXT NOT NULL,
+	to_kind TEXT NOT NULL DEFAULT 'sftp_client',
 	to_host TEXT NOT NULL,
 	to_port INTEGER NOT NULL,
 	to_username TEXT NOT NULL,
@@ -169,6 +212,10 @@ CREATE TABLE IF NOT EXISTS sftp_sync_jobs (
 		_ = db.Close()
 		return nil, fmt.Errorf("ensure sftp jobs schema: %w", err)
 	}
+	if err := ensureSFTPSyncJobSchemaColumns(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	manager := &sftpSyncJobManager{
 		db:                 db,
@@ -183,6 +230,16 @@ CREATE TABLE IF NOT EXISTS sftp_sync_jobs (
 		_ = db.Close()
 		return nil, err
 	}
+	if err := validatePersistedEmbeddedSFTPUsers(jobs); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	for _, job := range jobs {
+		if err := manager.ensureEmbeddedSFTPUsers(job); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	for _, job := range jobs {
 		if job.Enabled {
 			if err := manager.startRunner(job); err != nil {
@@ -193,6 +250,59 @@ CREATE TABLE IF NOT EXISTS sftp_sync_jobs (
 	}
 
 	return manager, nil
+}
+
+func ensureSFTPSyncJobSchemaColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(sftp_sync_jobs)`)
+	if err != nil {
+		return fmt.Errorf("query sftp jobs schema info: %w", err)
+	}
+	defer rows.Close()
+
+	columns := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal any
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &pk); err != nil {
+			return fmt.Errorf("scan sftp jobs schema info: %w", err)
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate sftp jobs schema info: %w", err)
+	}
+
+	for column, stmt := range map[string]string{
+		"from_kind": `ALTER TABLE sftp_sync_jobs ADD COLUMN from_kind TEXT NOT NULL DEFAULT 'sftp_client'`,
+		"to_kind":   `ALTER TABLE sftp_sync_jobs ADD COLUMN to_kind TEXT NOT NULL DEFAULT 'sftp_client'`,
+	} {
+		if _, exists := columns[column]; exists {
+			continue
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("add %s column to sftp jobs schema: %w", column, err)
+		}
+	}
+
+	if _, err := db.Exec(`
+UPDATE sftp_sync_jobs
+SET from_kind = 'sftp_client'
+WHERE from_kind IS NULL OR trim(from_kind) = ''`); err != nil {
+		return fmt.Errorf("backfill sftp jobs from_kind: %w", err)
+	}
+	if _, err := db.Exec(`
+UPDATE sftp_sync_jobs
+SET to_kind = 'sftp_client'
+WHERE to_kind IS NULL OR trim(to_kind) = ''`); err != nil {
+		return fmt.Errorf("backfill sftp jobs to_kind: %w", err)
+	}
+	return nil
 }
 
 func (m *sftpSyncJobManager) Close() error {
@@ -236,13 +346,15 @@ func (m *sftpSyncJobManager) Snapshot() ([]hostSFTPSyncJobView, error) {
 		view := hostSFTPSyncJobView{
 			ID:              job.ID,
 			FromNamespace:   job.From.Namespace,
-			FromAddress:     net.JoinHostPort(job.From.Host, strconv.Itoa(job.From.Port)),
+			FromKind:        job.From.displayKind(),
+			FromAddress:     job.From.connectionInfo().Address,
 			FromUsername:    job.From.Username,
-			FromDirectory:   job.From.Directory,
+			FromDirectory:   job.From.effectiveDirectory(),
 			ToNamespace:     job.To.Namespace,
-			ToAddress:       net.JoinHostPort(job.To.Host, strconv.Itoa(job.To.Port)),
+			ToKind:          job.To.displayKind(),
+			ToAddress:       job.To.connectionInfo().Address,
 			ToUsername:      job.To.Username,
-			ToDirectory:     job.To.Directory,
+			ToDirectory:     job.To.effectiveDirectory(),
 			Interval:        job.Interval.String(),
 			Enabled:         job.Enabled,
 			LastStatus:      job.LastStatus,
@@ -316,22 +428,27 @@ func (m *sftpSyncJobManager) CreateJob(spec sftpSyncJobSpec) (*sftpSyncJob, erro
 	if err != nil {
 		return nil, err
 	}
+	if err := m.validateEmbeddedSFTPUserConflicts(spec); err != nil {
+		return nil, err
+	}
 
 	now := m.now().UTC()
 	result, err := m.db.Exec(`
 INSERT INTO sftp_sync_jobs (
-	from_namespace, from_host, from_port, from_username, from_password, from_directory,
-	to_namespace, to_host, to_port, to_username, to_password, to_directory,
+	from_namespace, from_kind, from_host, from_port, from_username, from_password, from_directory,
+	to_namespace, to_kind, to_host, to_port, to_username, to_password, to_directory,
 	interval_seconds, enabled, last_run_at, last_success_at, last_status, last_error, last_files_copied,
 	created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', 'stopped', '', 0, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', 'stopped', '', 0, ?, ?)`,
 		spec.From.Namespace,
+		spec.From.Kind,
 		spec.From.Host,
 		spec.From.Port,
 		spec.From.Username,
 		spec.From.Password,
 		spec.From.Directory,
 		spec.To.Namespace,
+		spec.To.Kind,
 		spec.To.Host,
 		spec.To.Port,
 		spec.To.Username,
@@ -351,6 +468,10 @@ INSERT INTO sftp_sync_jobs (
 	}
 	job, err := m.loadJob(id)
 	if err != nil {
+		return nil, err
+	}
+	if err := m.ensureEmbeddedSFTPUsers(job); err != nil {
+		_, _ = m.db.Exec(`DELETE FROM sftp_sync_jobs WHERE id = ?`, id)
 		return nil, err
 	}
 	return &job, nil
@@ -413,8 +534,12 @@ func (m *sftpSyncJobManager) DeleteJob(id int64) (*sftpSyncJob, error) {
 	}
 
 	m.cancelRunner(id)
-	if err := m.removeJobStageDirs(job); err != nil {
-		return nil, err
+	cleanupErr := errors.Join(
+		m.removeEmbeddedSFTPUsers(job),
+		m.removeJobStageDirs(job),
+	)
+	if cleanupErr != nil {
+		return nil, cleanupErr
 	}
 
 	result, err := m.db.Exec(`DELETE FROM sftp_sync_jobs WHERE id = ?`, id)
@@ -468,6 +593,10 @@ func (m *sftpSyncJobManager) startRunner(job sftpSyncJob) error {
 		return nil
 	}
 	m.mu.Unlock()
+
+	if err := m.ensureEmbeddedSFTPUsers(job); err != nil {
+		return err
+	}
 
 	sourceRPC, err := m.lookupNamespaceRPC(job.From.Namespace)
 	if err != nil {
@@ -669,7 +798,7 @@ func (m *sftpSyncJobManager) downloadStageRequest(job sftpSyncJob) StartSFTPStag
 	return StartSFTPStageDownloadRequest{
 		JobID:               job.ID,
 		Connection:          job.From.connectionInfo(),
-		RemoteDirectory:     job.From.Directory,
+		RemoteDirectory:     job.From.effectiveDirectory(),
 		LocalIncomingDir:    sftpJobIncomingDir(pluginSandboxDataDir, job.ID),
 		LocalTmpDir:         sftpJobTmpDir(pluginSandboxDataDir, job.ID),
 		PollIntervalSeconds: int64(job.Interval / time.Second),
@@ -680,7 +809,7 @@ func (m *sftpSyncJobManager) uploadStageRequest(job sftpSyncJob) StartSFTPStageU
 	return StartSFTPStageUploadRequest{
 		JobID:               job.ID,
 		Connection:          job.To.connectionInfo(),
-		RemoteDirectory:     job.To.Directory,
+		RemoteDirectory:     job.To.effectiveDirectory(),
 		LocalIncomingDir:    sftpJobIncomingDir(pluginSandboxDataDir, job.ID),
 		LocalTmpDir:         sftpJobTmpDir(pluginSandboxDataDir, job.ID),
 		LocalAckDir:         sftpJobAckDir(pluginSandboxDataDir, job.ID),
@@ -712,16 +841,84 @@ func (m *sftpSyncJobManager) destinationAckDir(job sftpSyncJob) string {
 	return sftpJobAckDir(persistentPluginDataDir(m.persistentBase, job.To.Namespace), job.ID)
 }
 
+func (m *sftpSyncJobManager) sourceEndpointRoot(job sftpSyncJob) string {
+	return sftpJobEndpointRoot(persistentPluginDataDir(m.persistentBase, job.From.Namespace), job.ID, sftpEndpointRoleSource)
+}
+
+func (m *sftpSyncJobManager) destinationEndpointRoot(job sftpSyncJob) string {
+	return sftpJobEndpointRoot(persistentPluginDataDir(m.persistentBase, job.To.Namespace), job.ID, sftpEndpointRoleDestination)
+}
+
 func (m *sftpSyncJobManager) removeJobStageDirs(job sftpSyncJob) error {
 	for _, root := range []string{
 		m.sourceStageRoot(job),
 		m.destinationStageRoot(job),
+		m.sourceEndpointRoot(job),
+		m.destinationEndpointRoot(job),
 	} {
 		if err := os.RemoveAll(root); err != nil {
 			return fmt.Errorf("remove job stage root %q: %w", root, err)
 		}
 	}
 	return nil
+}
+
+func (m *sftpSyncJobManager) ensureEmbeddedSFTPUsers(job sftpSyncJob) error {
+	if err := m.ensureEmbeddedSFTPEndpoint(job.ID, sftpEndpointRoleSource, job.From); err != nil {
+		return err
+	}
+	if err := m.ensureEmbeddedSFTPEndpoint(job.ID, sftpEndpointRoleDestination, job.To); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *sftpSyncJobManager) ensureEmbeddedSFTPEndpoint(jobID int64, role string, endpoint sftpEndpointConfig) error {
+	if !endpoint.usesEmbeddedSFTPServer() {
+		return nil
+	}
+
+	rpc, err := m.lookupNamespaceRPC(endpoint.Namespace)
+	if err != nil {
+		return fmt.Errorf("%s namespace %q: %w", role, endpoint.Namespace, err)
+	}
+	if _, err := rpc.EnsureNamespaceSFTPUser(EnsureNamespaceSFTPUserRequest{
+		Username: endpoint.Username,
+		Password: endpoint.Password,
+		Root:     sftpJobEndpointRoot(pluginSandboxDataDir, jobID, role),
+		CanRead:  true,
+		CanWrite: true,
+	}); err != nil {
+		return fmt.Errorf("ensure %s embedded sftpserver user %q in namespace %q: %w", role, endpoint.Username, endpoint.Namespace, err)
+	}
+	return nil
+}
+
+func (m *sftpSyncJobManager) removeEmbeddedSFTPUsers(job sftpSyncJob) error {
+	return errors.Join(
+		m.removeEmbeddedSFTPEndpoint(job.ID, sftpEndpointRoleSource, job.From),
+		m.removeEmbeddedSFTPEndpoint(job.ID, sftpEndpointRoleDestination, job.To),
+	)
+}
+
+func (m *sftpSyncJobManager) removeEmbeddedSFTPEndpoint(jobID int64, role string, endpoint sftpEndpointConfig) error {
+	if !endpoint.usesEmbeddedSFTPServer() {
+		return nil
+	}
+
+	var removeErr error
+	rpc, err := m.lookupNamespaceRPC(endpoint.Namespace)
+	if err != nil {
+		removeErr = fmt.Errorf("%s namespace %q: %w", role, endpoint.Namespace, err)
+	} else if _, err := rpc.RemoveNamespaceSFTPUser(RemoveNamespaceSFTPUserRequest{Username: endpoint.Username}); err != nil {
+		removeErr = fmt.Errorf("remove %s embedded sftpserver user %q from namespace %q: %w", role, endpoint.Username, endpoint.Namespace, err)
+	}
+
+	hostRoot := sftpJobEndpointRoot(persistentPluginDataDir(m.persistentBase, endpoint.Namespace), jobID, role)
+	if err := os.RemoveAll(hostRoot); err != nil {
+		removeErr = errors.Join(removeErr, fmt.Errorf("remove %s embedded sftpserver root %q: %w", role, hostRoot, err))
+	}
+	return removeErr
 }
 
 func (m *sftpSyncJobManager) stopNamespaceStageWorkers(job sftpSyncJob) {
@@ -761,12 +958,14 @@ func (m *sftpSyncJobManager) listJobs() ([]sftpSyncJob, error) {
 SELECT
 	id,
 	from_namespace,
+	from_kind,
 	from_host,
 	from_port,
 	from_username,
 	from_password,
 	from_directory,
 	to_namespace,
+	to_kind,
 	to_host,
 	to_port,
 	to_username,
@@ -807,12 +1006,14 @@ func (m *sftpSyncJobManager) loadJob(id int64) (sftpSyncJob, error) {
 SELECT
 	id,
 	from_namespace,
+	from_kind,
 	from_host,
 	from_port,
 	from_username,
 	from_password,
 	from_directory,
 	to_namespace,
+	to_kind,
 	to_host,
 	to_port,
 	to_username,
@@ -856,12 +1057,14 @@ func scanSFTPSyncJob(scanner interface{ Scan(dest ...any) error }) (sftpSyncJob,
 	if err := scanner.Scan(
 		&job.ID,
 		&job.From.Namespace,
+		&job.From.Kind,
 		&job.From.Host,
 		&fromPort,
 		&job.From.Username,
 		&job.From.Password,
 		&job.From.Directory,
 		&job.To.Namespace,
+		&job.To.Kind,
 		&job.To.Host,
 		&toPort,
 		&job.To.Username,
@@ -882,6 +1085,8 @@ func scanSFTPSyncJob(scanner interface{ Scan(dest ...any) error }) (sftpSyncJob,
 
 	job.From.Port = fromPort
 	job.To.Port = toPort
+	job.From.Kind = normalizeSFTPEndpointKind(job.From.Kind)
+	job.To.Kind = normalizeSFTPEndpointKind(job.To.Kind)
 	job.Interval = time.Duration(intervalSeconds) * time.Second
 	job.Enabled = enabled != 0
 	job.LastRunAt = parseStoredJobTime(lastRunRaw)
@@ -909,23 +1114,39 @@ func normalizeAndValidateSFTPSyncJobSpec(spec sftpSyncJobSpec) (sftpSyncJobSpec,
 	return spec, nil
 }
 
+func normalizeSFTPEndpointKind(kind string) string {
+	normalized := strings.ToLower(strings.TrimSpace(kind))
+	switch normalized {
+	case "", sftpEndpointDisplayClient:
+		return sftpEndpointKindClient
+	default:
+		return normalized
+	}
+}
+
 func normalizeSFTPEndpointConfig(cfg sftpEndpointConfig) sftpEndpointConfig {
+	cfg.Kind = normalizeSFTPEndpointKind(cfg.Kind)
 	cfg.Namespace = strings.TrimSpace(cfg.Namespace)
 	cfg.Host = strings.Trim(strings.TrimSpace(cfg.Host), "[]")
 	cfg.Username = strings.TrimSpace(cfg.Username)
-	cfg.Directory = normalizeSFTPDirectory(cfg.Directory)
+	if cfg.usesEmbeddedSFTPServer() {
+		cfg.Host = ""
+		cfg.Port = 0
+		cfg.Directory = "/"
+	} else {
+		cfg.Directory = normalizeSFTPDirectory(cfg.Directory)
+	}
 	return cfg
 }
 
 func validateSFTPEndpointConfig(cfg sftpEndpointConfig, label string) error {
+	switch cfg.Kind {
+	case sftpEndpointKindClient, sftpEndpointKindServer:
+	default:
+		return fmt.Errorf("invalid %s endpoint kind %q", label, cfg.Kind)
+	}
 	if !validNamespaceName.MatchString(cfg.Namespace) {
 		return fmt.Errorf("invalid %s namespace %q", label, cfg.Namespace)
-	}
-	if cfg.Host == "" {
-		return fmt.Errorf("%s host is required", label)
-	}
-	if cfg.Port < 1 || cfg.Port > 65535 {
-		return fmt.Errorf("%s port %d is out of range", label, cfg.Port)
 	}
 	if cfg.Username == "" {
 		return fmt.Errorf("%s username is required", label)
@@ -933,8 +1154,71 @@ func validateSFTPEndpointConfig(cfg sftpEndpointConfig, label string) error {
 	if cfg.Password == "" {
 		return fmt.Errorf("%s password is required", label)
 	}
+	if cfg.usesEmbeddedSFTPServer() {
+		return nil
+	}
+	if cfg.Host == "" {
+		return fmt.Errorf("%s host is required", label)
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("%s port %d is out of range", label, cfg.Port)
+	}
 	if cfg.Directory == "" {
 		return fmt.Errorf("%s directory is required", label)
+	}
+	return nil
+}
+
+func sftpJobEndpointRoot(base string, jobID int64, role string) string {
+	return filepath.Join(filepath.Clean(base), sftpEndpointRootsDirName, strconv.FormatInt(jobID, 10), role)
+}
+
+func validatePersistedEmbeddedSFTPUsers(jobs []sftpSyncJob) error {
+	claimed := make(map[string]int64)
+	for _, job := range jobs {
+		for _, endpoint := range []sftpEndpointConfig{job.From, job.To} {
+			if !endpoint.usesEmbeddedSFTPServer() {
+				continue
+			}
+			key := endpoint.Namespace + "\x00" + endpoint.Username
+			if conflictJobID, exists := claimed[key]; exists {
+				return fmt.Errorf("embedded sftpserver username %q already used in namespace %q by job %d", endpoint.Username, endpoint.Namespace, conflictJobID)
+			}
+			claimed[key] = job.ID
+		}
+	}
+	return nil
+}
+
+func (m *sftpSyncJobManager) validateEmbeddedSFTPUserConflicts(spec sftpSyncJobSpec) error {
+	jobs, err := m.listJobs()
+	if err != nil {
+		return err
+	}
+
+	claimed := make(map[string]int64)
+	for _, job := range jobs {
+		for _, endpoint := range []sftpEndpointConfig{job.From, job.To} {
+			if !endpoint.usesEmbeddedSFTPServer() {
+				continue
+			}
+			claimed[endpoint.Namespace+"\x00"+endpoint.Username] = job.ID
+		}
+	}
+
+	seen := make(map[string]struct{})
+	for _, endpoint := range []sftpEndpointConfig{spec.From, spec.To} {
+		if !endpoint.usesEmbeddedSFTPServer() {
+			continue
+		}
+		key := endpoint.Namespace + "\x00" + endpoint.Username
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("embedded sftpserver username %q can only be used once in namespace %q", endpoint.Username, endpoint.Namespace)
+		}
+		if conflictJobID, exists := claimed[key]; exists {
+			return fmt.Errorf("embedded sftpserver username %q already used in namespace %q by job %d", endpoint.Username, endpoint.Namespace, conflictJobID)
+		}
+		seen[key] = struct{}{}
 	}
 	return nil
 }

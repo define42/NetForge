@@ -550,6 +550,12 @@ pre {
 </div>
 <div class="card">
 <form class="form-grid" method="post" action="/sftp-jobs/create">
+<label>From Provider
+<select name="from_kind" required>
+<option value="sftp_client" {{if or (eq .SFTPJobForm.FromKind "") (eq .SFTPJobForm.FromKind "sftp_client")}}selected{{end}}>sftp-client</option>
+<option value="sftpserver" {{if eq .SFTPJobForm.FromKind "sftpserver"}}selected{{end}}>sftpserver</option>
+</select>
+</label>
 <label>From Namespace
 <select name="from_namespace" required>
 <option value="">Select namespace</option>
@@ -559,10 +565,10 @@ pre {
 </select>
 </label>
 <label>From Server IP / Host
-<input type="text" name="from_host" placeholder="192.168.1.10" value="{{.SFTPJobForm.FromHost}}" required>
+<input type="text" name="from_host" placeholder="192.168.1.10" value="{{.SFTPJobForm.FromHost}}">
 </label>
 <label>From TCP Port
-<input type="number" name="from_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.FromPort}}" required>
+<input type="number" name="from_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.FromPort}}">
 </label>
 <label>From User Name
 <input type="text" name="from_username" placeholder="source-user" value="{{.SFTPJobForm.FromUsername}}" required>
@@ -571,7 +577,16 @@ pre {
 <input type="password" name="from_password" placeholder="password" required>
 </label>
 <label>From Directory
-<input type="text" name="from_directory" placeholder="/incoming" value="{{.SFTPJobForm.FromDirectory}}" required>
+<input type="text" name="from_directory" placeholder="/incoming" value="{{.SFTPJobForm.FromDirectory}}">
+</label>
+{{if eq .SFTPJobForm.FromKind "sftpserver"}}
+<div><code>From sftpserver listens on 0.0.0.0:2222 inside the namespace and uses remote root /; host, port, and directory are ignored. Internal job traffic still connects through 127.0.0.1:2222.</code></div>
+{{end}}
+<label>To Provider
+<select name="to_kind" required>
+<option value="sftp_client" {{if or (eq .SFTPJobForm.ToKind "") (eq .SFTPJobForm.ToKind "sftp_client")}}selected{{end}}>sftp-client</option>
+<option value="sftpserver" {{if eq .SFTPJobForm.ToKind "sftpserver"}}selected{{end}}>sftpserver</option>
+</select>
 </label>
 <label>To Namespace
 <select name="to_namespace" required>
@@ -582,10 +597,10 @@ pre {
 </select>
 </label>
 <label>To Server IP / Host
-<input type="text" name="to_host" placeholder="192.168.1.20" value="{{.SFTPJobForm.ToHost}}" required>
+<input type="text" name="to_host" placeholder="192.168.1.20" value="{{.SFTPJobForm.ToHost}}">
 </label>
 <label>To TCP Port
-<input type="number" name="to_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.ToPort}}" required>
+<input type="number" name="to_port" min="1" max="65535" placeholder="22" value="{{.SFTPJobForm.ToPort}}">
 </label>
 <label>To User Name
 <input type="text" name="to_username" placeholder="dest-user" value="{{.SFTPJobForm.ToUsername}}" required>
@@ -594,8 +609,11 @@ pre {
 <input type="password" name="to_password" placeholder="password" required>
 </label>
 <label>To Directory
-<input type="text" name="to_directory" placeholder="/archive" value="{{.SFTPJobForm.ToDirectory}}" required>
+<input type="text" name="to_directory" placeholder="/archive" value="{{.SFTPJobForm.ToDirectory}}">
 </label>
+{{if eq .SFTPJobForm.ToKind "sftpserver"}}
+<div><code>To sftpserver listens on 0.0.0.0:2222 inside the namespace and uses remote root /; host, port, and directory are ignored. Internal job traffic still connects through 127.0.0.1:2222.</code></div>
+{{end}}
 <label>Run Interval
 <input type="text" name="interval" placeholder="5m" value="{{.SFTPJobForm.Interval}}" required>
 </label>
@@ -629,8 +647,8 @@ pre {
 {{range .Jobs}}
 <tr>
 <td><code>{{.ID}}</code></td>
-<td><code>{{.FromNamespace}}</code><br><code>{{.FromAddress}}</code><br><code>{{.FromUsername}}</code><br><code>{{.FromDirectory}}</code></td>
-<td><code>{{.ToNamespace}}</code><br><code>{{.ToAddress}}</code><br><code>{{.ToUsername}}</code><br><code>{{.ToDirectory}}</code></td>
+<td><code>{{.FromNamespace}}</code><br><code>{{.FromKind}}</code><br><code>{{.FromAddress}}</code><br><code>{{.FromUsername}}</code><br><code>{{.FromDirectory}}</code></td>
+<td><code>{{.ToNamespace}}</code><br><code>{{.ToKind}}</code><br><code>{{.ToAddress}}</code><br><code>{{.ToUsername}}</code><br><code>{{.ToDirectory}}</code></td>
 <td><code>{{.Interval}}</code></td>
 <td>
 {{if .Enabled}}

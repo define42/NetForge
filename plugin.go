@@ -32,6 +32,7 @@ type namespaceHTTPService struct {
 	sftpServer          sftpServerLifecycle
 	sftpAddr            string
 	sftpPort            int
+	sftpUsers           map[string]EnsureNamespaceSFTPUserRequest
 	downloadWorkers     map[int64]sftpStageDownloadWorker
 	uploadWorkers       map[int64]sftpStageUploadWorker
 	nextSFTPStageWorker uint64

@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -16,11 +17,37 @@ import (
 	"testing"
 	"time"
 
+	sftpserverpkg "github.com/define42/NetForge/internal/sftpserver"
 	"golang.org/x/crypto/ssh"
 )
 
 type localSFTPClient struct {
 	root string
+}
+
+type fakeManagedSFTPServer struct {
+	users       map[string]sftpserverpkg.UserInfo
+	addCalls    []string
+	removeCalls []string
+}
+
+func (s *fakeManagedSFTPServer) Serve(net.Listener) error { return nil }
+
+func (s *fakeManagedSFTPServer) Close() error { return nil }
+
+func (s *fakeManagedSFTPServer) ListeningAddr() net.Addr { return nil }
+
+func (s *fakeManagedSFTPServer) AddUser(username string, info sftpserverpkg.UserInfo) {
+	if s.users == nil {
+		s.users = make(map[string]sftpserverpkg.UserInfo)
+	}
+	s.users[username] = info
+	s.addCalls = append(s.addCalls, username)
+}
+
+func (s *fakeManagedSFTPServer) RemoveUser(username string) {
+	delete(s.users, username)
+	s.removeCalls = append(s.removeCalls, username)
 }
 
 func (c *localSFTPClient) ReadDir(remotePath string) ([]os.FileInfo, error) {
@@ -362,6 +389,91 @@ func TestNamespaceHTTPServiceSFTPOperations(t *testing.T) {
 	}
 }
 
+func TestNamespaceHTTPServiceEmbeddedSFTPUserLifecycle(t *testing.T) {
+	originalValidateRoot := validateNamespaceSFTPUserRoot
+	originalCreateRoot := createNamespaceSFTPUserRoot
+	validateNamespaceSFTPUserRoot = func(string) error { return nil }
+	createNamespaceSFTPUserRoot = func(root string) error {
+		return os.MkdirAll(root, 0o700)
+	}
+	t.Cleanup(func() {
+		validateNamespaceSFTPUserRoot = originalValidateRoot
+		createNamespaceSFTPUserRoot = originalCreateRoot
+	})
+
+	server := &fakeManagedSFTPServer{}
+	svc := &namespaceHTTPService{
+		cfg:        PluginConfig{Namespace: "ns-sftp"},
+		sftpServer: server,
+	}
+
+	root := filepath.Join(t.TempDir(), "managed-root")
+	status, err := svc.EnsureNamespaceSFTPUser(EnsureNamespaceSFTPUserRequest{
+		Username: "job-user",
+		Password: "secret",
+		Root:     root,
+		CanRead:  true,
+		CanWrite: true,
+	})
+	if err != nil {
+		t.Fatalf("EnsureNamespaceSFTPUser failed: %v", err)
+	}
+	if !status.Exists || status.Root != root || !status.CanRead || !status.CanWrite {
+		t.Fatalf("unexpected ensure status: %+v", status)
+	}
+	if info, ok := server.users["job-user"]; !ok || info.Root != root || info.Password != "secret" {
+		t.Fatalf("expected running server to receive user update, got %+v", server.users)
+	}
+
+	updatedRoot := filepath.Join(t.TempDir(), "managed-root-updated")
+	status, err = svc.EnsureNamespaceSFTPUser(EnsureNamespaceSFTPUserRequest{
+		Username: "job-user",
+		Password: "new-secret",
+		Root:     updatedRoot,
+		CanRead:  true,
+		CanWrite: true,
+	})
+	if err != nil {
+		t.Fatalf("EnsureNamespaceSFTPUser update failed: %v", err)
+	}
+	if len(server.addCalls) != 2 {
+		t.Fatalf("expected two AddUser calls, got %v", server.addCalls)
+	}
+	if info := server.users["job-user"]; info.Root != updatedRoot || info.Password != "new-secret" {
+		t.Fatalf("expected updated running user config, got %+v", info)
+	}
+
+	gotStatus, err := svc.GetNamespaceSFTPUserStatus(NamespaceSFTPUserStatusRequest{Username: "job-user"})
+	if err != nil {
+		t.Fatalf("GetNamespaceSFTPUserStatus failed: %v", err)
+	}
+	if !gotStatus.Exists || gotStatus.Root != updatedRoot {
+		t.Fatalf("unexpected user status: %+v", gotStatus)
+	}
+
+	removed, err := svc.RemoveNamespaceSFTPUser(RemoveNamespaceSFTPUserRequest{Username: "job-user"})
+	if err != nil {
+		t.Fatalf("RemoveNamespaceSFTPUser failed: %v", err)
+	}
+	if removed.Username != "job-user" || removed.Exists {
+		t.Fatalf("unexpected remove status: %+v", removed)
+	}
+	if len(server.removeCalls) != 1 || server.removeCalls[0] != "job-user" {
+		t.Fatalf("expected RemoveUser call for job-user, got %v", server.removeCalls)
+	}
+	if _, exists := server.users["job-user"]; exists {
+		t.Fatalf("expected running server user to be removed, got %+v", server.users)
+	}
+
+	gotStatus, err = svc.GetNamespaceSFTPUserStatus(NamespaceSFTPUserStatusRequest{Username: "job-user"})
+	if err != nil {
+		t.Fatalf("GetNamespaceSFTPUserStatus after remove failed: %v", err)
+	}
+	if gotStatus.Exists {
+		t.Fatalf("expected removed user to be absent, got %+v", gotStatus)
+	}
+}
+
 func mustAuthorizedPublicKey(t *testing.T) string {
 	t.Helper()
 
@@ -685,6 +797,116 @@ func TestRunHostSFTPStageBridgeCycleCopiesAndReapsAcks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(destinationAckDir, "nested", "demo.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected ack marker to be removed after reap, got %v", err)
+	}
+}
+
+func TestCopySourceStageToDestinationStageNormalizesOwnership(t *testing.T) {
+	sourceIncomingDir := filepath.Join(t.TempDir(), "source-incoming")
+	destinationIncomingDir := filepath.Join(t.TempDir(), "destination-incoming")
+	destinationTmpDir := filepath.Join(t.TempDir(), "destination-tmp")
+	destinationAckDir := filepath.Join(t.TempDir(), "destination-acks")
+	if err := os.MkdirAll(filepath.Join(sourceIncomingDir, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll source incoming failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceIncomingDir, "nested", "demo.txt"), []byte("payload"), 0o640); err != nil {
+		t.Fatalf("WriteFile source demo failed: %v", err)
+	}
+
+	originalNormalizeOwnership := shouldNormalizeLocalStageOwnership
+	originalChown := chownLocalStagePath
+	shouldNormalizeLocalStageOwnership = func() bool { return true }
+	var chowned []string
+	chownLocalStagePath = func(path string, uid, gid int) error {
+		chowned = append(chowned, filepath.Clean(path))
+		return nil
+	}
+	t.Cleanup(func() {
+		shouldNormalizeLocalStageOwnership = originalNormalizeOwnership
+		chownLocalStagePath = originalChown
+	})
+
+	result, err := runHostSFTPStageBridgeCycle(sourceIncomingDir, destinationIncomingDir, destinationTmpDir, destinationAckDir)
+	if err != nil {
+		t.Fatalf("runHostSFTPStageBridgeCycle failed: %v", err)
+	}
+	if result.CopiedFiles != 1 {
+		t.Fatalf("unexpected copy cycle result: %+v", result)
+	}
+
+	wantPaths := map[string]struct{}{
+		filepath.Clean(filepath.Join(destinationIncomingDir, "nested", "demo.txt")): {},
+		filepath.Clean(filepath.Join(destinationIncomingDir, "nested")):             {},
+		filepath.Clean(destinationIncomingDir):                                      {},
+		filepath.Clean(filepath.Join(destinationTmpDir, "nested")):                  {},
+		filepath.Clean(destinationTmpDir):                                           {},
+	}
+	for want := range wantPaths {
+		found := false
+		for _, got := range chowned {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected ownership normalization for %q, got %+v", want, chowned)
+		}
+	}
+}
+
+func TestRunHostSFTPStageBridgeCycleRepairsExistingDestinationOwnership(t *testing.T) {
+	sourceIncomingDir := filepath.Join(t.TempDir(), "source-incoming")
+	destinationIncomingDir := filepath.Join(t.TempDir(), "destination-incoming")
+	destinationTmpDir := filepath.Join(t.TempDir(), "destination-tmp")
+	destinationAckDir := filepath.Join(t.TempDir(), "destination-acks")
+	if err := os.MkdirAll(filepath.Join(destinationIncomingDir, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll destination incoming failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(destinationIncomingDir, "nested", "stale.txt"), []byte("stale"), 0o600); err != nil {
+		t.Fatalf("WriteFile stale file failed: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(destinationTmpDir, "nested"), 0o755); err != nil {
+		t.Fatalf("MkdirAll destination tmp failed: %v", err)
+	}
+
+	originalNormalizeOwnership := shouldNormalizeLocalStageOwnership
+	originalChown := chownLocalStagePath
+	shouldNormalizeLocalStageOwnership = func() bool { return true }
+	var chowned []string
+	chownLocalStagePath = func(path string, uid, gid int) error {
+		chowned = append(chowned, filepath.Clean(path))
+		return nil
+	}
+	t.Cleanup(func() {
+		shouldNormalizeLocalStageOwnership = originalNormalizeOwnership
+		chownLocalStagePath = originalChown
+	})
+
+	result, err := runHostSFTPStageBridgeCycle(sourceIncomingDir, destinationIncomingDir, destinationTmpDir, destinationAckDir)
+	if err != nil {
+		t.Fatalf("runHostSFTPStageBridgeCycle failed: %v", err)
+	}
+	if result.CopiedFiles != 0 || result.CompletedFiles != 0 {
+		t.Fatalf("unexpected bridge cycle result: %+v", result)
+	}
+
+	for _, want := range []string{
+		filepath.Clean(destinationIncomingDir),
+		filepath.Clean(filepath.Join(destinationIncomingDir, "nested")),
+		filepath.Clean(filepath.Join(destinationIncomingDir, "nested", "stale.txt")),
+		filepath.Clean(destinationTmpDir),
+		filepath.Clean(filepath.Join(destinationTmpDir, "nested")),
+	} {
+		found := false
+		for _, got := range chowned {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected ownership repair for %q, got %+v", want, chowned)
+		}
 	}
 }
 

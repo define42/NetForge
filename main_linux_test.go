@@ -65,10 +65,15 @@ type stubNamespaceService struct {
 	stageUploadStartHook    func(StartSFTPStageUploadRequest) (*SFTPStageWorkerStatus, error)
 	stageUploadStopHook     func(int64) (*SFTPStageWorkerStatus, error)
 	stageUploadStatusHook   func(int64) (*SFTPStageWorkerStatus, error)
+	ensureSFTPUserHook      func(EnsureNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error)
+	removeSFTPUserHook      func(RemoveNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error)
+	getSFTPUserStatusHook   func(NamespaceSFTPUserStatusRequest) (*NamespaceSFTPUserStatusResponse, error)
 	stageDownloadStatus     *SFTPStageWorkerStatus
 	stageDownloadErr        error
 	stageUploadStatus       *SFTPStageWorkerStatus
 	stageUploadErr          error
+	sftpUserStatus          *NamespaceSFTPUserStatusResponse
+	sftpUserErr             error
 	stopErr                 error
 	stopSFTPErr             error
 	status                  *StatusResponse
@@ -102,7 +107,7 @@ func (s *stubNamespaceService) StartSFTP(port int) (*StartSFTPResponse, error) {
 	if s.sftpStart != nil {
 		return s.sftpStart, nil
 	}
-	return &StartSFTPResponse{SFTPAddr: fmt.Sprintf(":%d", port)}, nil
+	return &StartSFTPResponse{SFTPAddr: pluginSFTPBindAddress(port)}, nil
 }
 
 func (s *stubNamespaceService) CheckTCPPort(targetIP string, port int) (string, error) {
@@ -265,6 +270,48 @@ func (s *stubNamespaceService) GetSFTPStageUploadStatus(jobID int64) (*SFTPStage
 	return &SFTPStageWorkerStatus{JobID: jobID}, nil
 }
 
+func (s *stubNamespaceService) EnsureNamespaceSFTPUser(req EnsureNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	if s.ensureSFTPUserHook != nil {
+		return s.ensureSFTPUserHook(req)
+	}
+	if s.sftpUserErr != nil {
+		return nil, s.sftpUserErr
+	}
+	if s.sftpUserStatus != nil {
+		return s.sftpUserStatus, nil
+	}
+	return &NamespaceSFTPUserStatusResponse{
+		Username: req.Username,
+		Exists:   true,
+		Root:     req.Root,
+		CanRead:  req.CanRead,
+		CanWrite: req.CanWrite,
+	}, nil
+}
+
+func (s *stubNamespaceService) RemoveNamespaceSFTPUser(req RemoveNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	if s.removeSFTPUserHook != nil {
+		return s.removeSFTPUserHook(req)
+	}
+	if s.sftpUserErr != nil {
+		return nil, s.sftpUserErr
+	}
+	return &NamespaceSFTPUserStatusResponse{Username: req.Username}, nil
+}
+
+func (s *stubNamespaceService) GetNamespaceSFTPUserStatus(req NamespaceSFTPUserStatusRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	if s.getSFTPUserStatusHook != nil {
+		return s.getSFTPUserStatusHook(req)
+	}
+	if s.sftpUserErr != nil {
+		return nil, s.sftpUserErr
+	}
+	if s.sftpUserStatus != nil {
+		return s.sftpUserStatus, nil
+	}
+	return &NamespaceSFTPUserStatusResponse{Username: req.Username}, nil
+}
+
 func (s *stubNamespaceService) StopHTTP() error {
 	if s.stopErr != nil {
 		return s.stopErr
@@ -316,7 +363,7 @@ func (s *delayedNamespaceService) StartHTTP(port int) (*StartHTTPResponse, error
 }
 
 func (s *delayedNamespaceService) StartSFTP(port int) (*StartSFTPResponse, error) {
-	return &StartSFTPResponse{SFTPAddr: fmt.Sprintf(":%d", port)}, nil
+	return &StartSFTPResponse{SFTPAddr: pluginSFTPBindAddress(port)}, nil
 }
 
 func (s *delayedNamespaceService) CheckTCPPort(targetIP string, port int) (string, error) {
@@ -369,6 +416,24 @@ func (s *delayedNamespaceService) StopSFTPStageUpload(jobID int64) (*SFTPStageWo
 
 func (s *delayedNamespaceService) GetSFTPStageUploadStatus(jobID int64) (*SFTPStageWorkerStatus, error) {
 	return &SFTPStageWorkerStatus{JobID: jobID, Running: true}, nil
+}
+
+func (s *delayedNamespaceService) EnsureNamespaceSFTPUser(req EnsureNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	return &NamespaceSFTPUserStatusResponse{
+		Username: req.Username,
+		Exists:   true,
+		Root:     req.Root,
+		CanRead:  req.CanRead,
+		CanWrite: req.CanWrite,
+	}, nil
+}
+
+func (s *delayedNamespaceService) RemoveNamespaceSFTPUser(req RemoveNamespaceSFTPUserRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	return &NamespaceSFTPUserStatusResponse{Username: req.Username}, nil
+}
+
+func (s *delayedNamespaceService) GetNamespaceSFTPUserStatus(req NamespaceSFTPUserStatusRequest) (*NamespaceSFTPUserStatusResponse, error) {
+	return &NamespaceSFTPUserStatusResponse{Username: req.Username}, nil
 }
 
 func (s *delayedNamespaceService) StopHTTP() error {
@@ -598,11 +663,11 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 		describe: &DescribeResponse{
 			Namespace: "ns-rpc",
 			HTTPAddr:  ":19090",
-			SFTPAddr:  ":2222",
+			SFTPAddr:  pluginSFTPBindAddress(pluginSFTPPort),
 			Message:   "plugin ready",
 		},
 		start:          &StartHTTPResponse{HTTPAddr: ":19090"},
-		sftpStart:      &StartSFTPResponse{SFTPAddr: ":2222"},
+		sftpStart:      &StartSFTPResponse{SFTPAddr: pluginSFTPBindAddress(pluginSFTPPort)},
 		checkTCPOutput: "tcp connect to 192.0.2.10:19090 from ns-rpc succeeded",
 		sftpList: &SFTPListResponse{
 			Entries: []SFTPEntry{
@@ -637,6 +702,13 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 			Path:    "/upload/demo.txt",
 			Removed: true,
 		},
+		sftpUserStatus: &NamespaceSFTPUserStatusResponse{
+			Username: "job-user",
+			Exists:   true,
+			Root:     "/data/sftp-endpoints/1/source",
+			CanRead:  true,
+			CanWrite: true,
+		},
 		status: &StatusResponse{
 			Namespace:   "ns-rpc",
 			Interface:   "eth0.42",
@@ -647,7 +719,7 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 			AllowICMP:   true,
 			HTTPAddr:    ":19090",
 			HTTPRunning: true,
-			SFTPAddr:    ":2222",
+			SFTPAddr:    pluginSFTPBindAddress(pluginSFTPPort),
 			SFTPRunning: true,
 		},
 	}
@@ -666,7 +738,7 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 	if err := server.Describe(struct{}{}, &describe); err != nil {
 		t.Fatalf("Describe failed: %v", err)
 	}
-	if describe.Namespace != "ns-rpc" || describe.HTTPAddr != ":19090" || describe.SFTPAddr != ":2222" {
+	if describe.Namespace != "ns-rpc" || describe.HTTPAddr != ":19090" || describe.SFTPAddr != pluginSFTPBindAddress(pluginSFTPPort) {
 		t.Fatalf("unexpected describe response: %+v", describe)
 	}
 
@@ -682,7 +754,7 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 	if err := server.StartSFTP(pluginSFTPPort, &sftpStart); err != nil {
 		t.Fatalf("StartSFTP failed: %v", err)
 	}
-	if sftpStart.SFTPAddr != ":2222" {
+	if sftpStart.SFTPAddr != pluginSFTPBindAddress(pluginSFTPPort) {
 		t.Fatalf("unexpected sftp start response: %+v", sftpStart)
 	}
 
@@ -742,6 +814,36 @@ func TestNamespaceServicePluginServerRPCWrappers(t *testing.T) {
 		t.Fatalf("unexpected SFTPDelete response: %+v", del)
 	}
 
+	var ensured NamespaceSFTPUserStatusResponse
+	if err := server.EnsureNamespaceSFTPUser(EnsureNamespaceSFTPUserRequest{
+		Username: "job-user",
+		Password: "secret",
+		Root:     "/data/sftp-endpoints/1/source",
+		CanRead:  true,
+		CanWrite: true,
+	}, &ensured); err != nil {
+		t.Fatalf("EnsureNamespaceSFTPUser failed: %v", err)
+	}
+	if ensured.Username != "job-user" || !ensured.Exists || ensured.Root != "/data/sftp-endpoints/1/source" {
+		t.Fatalf("unexpected EnsureNamespaceSFTPUser response: %+v", ensured)
+	}
+
+	var userStatus NamespaceSFTPUserStatusResponse
+	if err := server.GetNamespaceSFTPUserStatus(NamespaceSFTPUserStatusRequest{Username: "job-user"}, &userStatus); err != nil {
+		t.Fatalf("GetNamespaceSFTPUserStatus failed: %v", err)
+	}
+	if userStatus.Username != "job-user" || !userStatus.Exists {
+		t.Fatalf("unexpected GetNamespaceSFTPUserStatus response: %+v", userStatus)
+	}
+
+	var removedUser NamespaceSFTPUserStatusResponse
+	if err := server.RemoveNamespaceSFTPUser(RemoveNamespaceSFTPUserRequest{Username: "job-user"}, &removedUser); err != nil {
+		t.Fatalf("RemoveNamespaceSFTPUser failed: %v", err)
+	}
+	if removedUser.Username != "job-user" {
+		t.Fatalf("unexpected RemoveNamespaceSFTPUser response: %+v", removedUser)
+	}
+
 	if err := server.StopHTTP(struct{}{}, &struct{}{}); err != nil {
 		t.Fatalf("StopHTTP failed: %v", err)
 	}
@@ -797,7 +899,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartSFTP failed: %v", err)
 	}
-	if sftpStart.SFTPAddr != ":0" {
+	if sftpStart.SFTPAddr != pluginSFTPBindAddress(0) {
 		t.Fatalf("unexpected sftp addr: %q", sftpStart.SFTPAddr)
 	}
 
@@ -805,7 +907,7 @@ func TestNamespaceHTTPServiceLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Describe after start failed: %v", err)
 	}
-	if desc.HTTPAddr != ":18080" || desc.SFTPAddr != ":0" {
+	if desc.HTTPAddr != ":18080" || desc.SFTPAddr != pluginSFTPBindAddress(0) {
 		t.Fatalf("unexpected describe addr after start: %+v", desc)
 	}
 
@@ -2530,8 +2632,8 @@ func TestExternalPluginInNamespaceEndToEnd(t *testing.T) {
 	if desc.Namespace != nsName {
 		t.Fatalf("describe namespace mismatch: got %q want %q", desc.Namespace, nsName)
 	}
-	if desc.SFTPAddr != fmt.Sprintf(":%d", pluginSFTPPort) {
-		t.Fatalf("describe sftp addr mismatch: got %q want %q", desc.SFTPAddr, fmt.Sprintf(":%d", pluginSFTPPort))
+	if desc.SFTPAddr != pluginSFTPBindAddress(pluginSFTPPort) {
+		t.Fatalf("describe sftp addr mismatch: got %q want %q", desc.SFTPAddr, pluginSFTPBindAddress(pluginSFTPPort))
 	}
 
 	status, err := proc.rpc.Status()
